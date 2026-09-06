@@ -1,0 +1,53 @@
+# Training Configuration
+
+# Random Seed
+seed: 150914
+
+# Time limit in seconds (48 hours)
+time_limit: 172800
+
+# Data Configuration
+data_path: "../sxs/sxs_waves_allmodes_8192.h5"
+modes:
+  - [2, 2]
+  - [3, 3]
+  - [2, 1]
+  - [4, 4]
+  - [3, 2]
+  - [5, 5]
+  - [4, 3]
+
+# Model Configuration
+model:
+  layers: [256, 1024, 512]
+  pretrain_path_template: "pretrain_files_NRHybSur3dq8/{mode}/models/decoder.pt"
+
+# Training Configuration
+training:
+  num_epochs: 10000
+  learning_rate: 3.0e-6
+  batch_size_ratio: 0.2 # Fraction of dataset for batch size
+  early_stopping:
+    patience: 2000
+    delta: 1.0e-3
+  raw_mode_loss:
+    enabled: true
+    weight: 0.5  # Weight for raw mode loss (0 = sphere only, 1 = raw only)
+
+# LBFGS Fine-tuning Configuration
+lbfgs:
+  enabled: false
+  learning_rate: 1.0
+  num_epochs: 1000
+  max_iter: 20
+  history_size: 100
+  early_stopping:
+    patience: 100
+    delta: 1.0e-4
+
+# Output Configuration
+output:
+  models_dir: "models/rolling"
+  plots_dir: "plots"
+  plotting: true
+  verbose: true
