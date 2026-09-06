@@ -1,8 +1,8 @@
-# DANSur_HM — Dual-stage Artificial Neural Surrogate (Higher-Mode)
+# DANSur_HM — Dual-stage Artificial Neural Surrogate (Now with Higher-Modes!)
 
 A fast, accurate neural surrogate for gravitational waveforms from
 quasi-circular, aligned-spin binary black hole mergers, including
-higher-order spherical harmonic modes.
+higher-order spherical harmonic modes. Follow up to [arXiv:2412.06946](https://arxiv.org/abs/2412.06946), where only the (2,2) mode was considered.
 
 Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
 
