@@ -30,7 +30,381 @@ import torch
 from dansur.utils.utils import *
 from dansur.surrogate.sur_utils import DANSur
 from functools import wraps
-from bilby_run import model_gen_func, _numba_taper_start, _sYlm
+from gwsurrogate.surrogate import _sYlm
+import numba
+
+
+@numba.njit
+def _numba_taper_start(data):
+    length = len(data)
+    start = -1
+    for i in range(length):
+        if data[i] != 0.0:
+            start = i
+            break
+    if start == -1:
+        return data
+    end = -1
+    for i in range(length - 1, -1, -1):
+        if data[i] != 0.0:
+            end = i
+            break
+    if end - start <= 1:
+        return data
+    mid = (start + end) // 2
+    flag = 0
+    i = start + 1
+    n = 0
+    LALSIMULATION_RINGING_EXTENT = 19
+    while flag < 2 and i != mid:
+        val_i = abs(data[i])
+        if val_i >= abs(data[i-1]) and val_i >= abs(data[i+1]):
+            if val_i == abs(data[i+1]):
+                i += 1
+            if i - start > LALSIMULATION_RINGING_EXTENT:
+                flag += 1
+            n = i - start
+        i += 1
+    if flag < 2:
+        n = mid - start
+    if n > 1:
+        data[start] = 0.0
+        realN = float(n)
+        for j in range(start + 1, start + n - 1):
+            realI = float(j - start)
+            z = (realN - 1.0) / realI + (realN - 1.0) / (realI - (realN - 1.0))
+            sigma = 1.0 / (np.exp(z) + 1.0)
+            data[j] = data[j] * sigma
+    return data
+
+
+@numba.njit
+def _numba_compute_v0(phase_0: float, phase_1: float, dt: float) -> float:
+    """Compute initial characteristic velocity v0 = (omega_orb)^(1/3)
+    from two consecutive (2,2)-mode phase samples.
+    
+    omega_22 = d(phi_22)/dt  =>  omega_orb = omega_22 / 2
+    v0 = omega_orb^(1/3)
+    
+    Takes the absolute value of omega_22 to guard against sign conventions.
+    Returns a real, positive v0.
+    """
+    omega_22 = (phase_1 - phase_0) / dt
+    if omega_22 < 0.0:
+        omega_22 = -omega_22
+    omega_orb = omega_22 / 2.0
+    # cube root via exponentiation
+    return omega_orb ** (1.0 / 3.0)
+
+
+@numba.njit
+def _numba_taper_complex(data_real, data_imag):
+    """Taper both real and imaginary parts of a complex mode in one pass.
+    Equivalent to two calls of _numba_taper_start but avoids redundant
+    boundary-detection work by reusing the taper window computed for the
+    real part on the imaginary part as well.
+    Returns (tapered_real, tapered_imag).
+    """
+    length = len(data_real)
+    start = -1
+    for i in range(length):
+        if data_real[i] != 0.0 or data_imag[i] != 0.0:
+            start = i
+            break
+    if start == -1:
+        return data_real, data_imag
+    end = -1
+    for i in range(length - 1, -1, -1):
+        if data_real[i] != 0.0 or data_imag[i] != 0.0:
+            end = i
+            break
+    if end - start <= 1:
+        return data_real, data_imag
+    mid = (start + end) // 2
+    flag = 0
+    i = start + 1
+    n = 0
+    LALSIMULATION_RINGING_EXTENT = 19
+    amp_i = (data_real[i]**2 + data_imag[i]**2) ** 0.5
+    while flag < 2 and i != mid:
+        amp_im1 = (data_real[i-1]**2 + data_imag[i-1]**2) ** 0.5
+        amp_ip1 = (data_real[i+1]**2 + data_imag[i+1]**2) ** 0.5
+        if amp_i >= amp_im1 and amp_i >= amp_ip1:
+            if amp_i == amp_ip1:
+                i += 1
+                amp_i = amp_ip1
+            if i - start > LALSIMULATION_RINGING_EXTENT:
+                flag += 1
+            n = i - start
+        i += 1
+        if i < length:
+            amp_i = (data_real[i]**2 + data_imag[i]**2) ** 0.5
+    if flag < 2:
+        n = mid - start
+    if n > 1:
+        data_real[start] = 0.0
+        data_imag[start] = 0.0
+        realN = float(n)
+        for j in range(start + 1, start + n - 1):
+            realI = float(j - start)
+            z = (realN - 1.0) / realI + (realN - 1.0) / (realI - (realN - 1.0))
+            sigma = 1.0 / (np.exp(z) + 1.0)
+            data_real[j] = data_real[j] * sigma
+            data_imag[j] = data_imag[j] * sigma
+    return data_real, data_imag
+
+
+@numba.njit(parallel=True)
+def _numba_taper_roll_align_modes(
+    modes_real,      # shape (n_modes, n_samples) — real parts, C-contiguous, will be modified in-place
+    modes_imag,      # shape (n_modes, n_samples) — imag parts
+    roll_by,         # int: number of positions to roll left (peak_idx)
+    m_vals,          # int64 array, shape (n_modes,): the m index of each mode
+    phi22_peak,      # float: arg(h22[0]) after rolling
+):
+    """Fused kernel: taper + roll + peak-phase align for all modes.
+
+    Operates in-place on modes_real / modes_imag (pre-copied).
+    Returns (out_real, out_imag) of the same shape, with:
+      1. Planck taper applied at the start of each mode.
+      2. Array rolled left by roll_by (cyclic, merger placed at index 0).
+      3. Each mode rotated by exp(-i * (m/2) * phi22_peak) to zero the
+         (2,2) peak phase and preserve relative inter-mode phases.
+    """
+    n_modes, n = modes_real.shape
+    out_real = np.empty_like(modes_real)
+    out_imag = np.empty_like(modes_imag)
+
+    for k in numba.prange(n_modes):  # parallel over modes
+        # --- 1. Taper ---
+        dr = modes_real[k].copy()
+        di = modes_imag[k].copy()
+        dr, di = _numba_taper_complex(dr, di)
+
+        # --- 2. Roll left by roll_by (equivalent to np.roll(arr, -roll_by)) ---
+        roll_by_mod = roll_by % n
+        tmp_r = np.empty(n)
+        tmp_i = np.empty(n)
+        for j in range(n):
+            src = (j + roll_by_mod) % n
+            tmp_r[j] = dr[src]
+            tmp_i[j] = di[src]
+
+        # --- 3. Phase align: rotate by exp(-i * (m/2) * phi22_peak) ---
+        m_half = m_vals[k] / 2.0
+        angle = -m_half * phi22_peak
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        for j in range(n):
+            r = tmp_r[j]
+            im = tmp_i[j]
+            out_real[k, j] = r * cos_a - im * sin_a
+            out_imag[k, j] = r * sin_a + im * cos_a
+
+    return out_real, out_imag
+
+
+@numba.njit(parallel=True)
+def _numba_mode_sum_from_precomputed(
+    modes_real,    # shape (n_modes, n_samples)
+    modes_imag,    # shape (n_modes, n_samples)
+    ylm_real,      # shape (n_modes,): real part of sYlm(-2, l, m, theta, phi)
+    ylm_imag,      # shape (n_modes,): imag part
+):
+    """Mode sum: h = sum_{l,m in dict} Y_{l,m}(theta, phi) * h_{l,m}
+
+    Replaces gwsurrogate's _mode_sum with fake_neg_modes=False.
+    The (-m) modes are already present in the mode array (DANSur.__call__
+    inserts them when inclination=None), so no symmetry correction is needed.
+    Runs parallel over samples.
+    Returns (h_real, h_imag) of shape (n_samples,).
+    """
+    n_modes, n = modes_real.shape
+    h_real = np.zeros(n)
+    h_imag = np.zeros(n)
+
+    for j in numba.prange(n):
+        hr = 0.0
+        hi = 0.0
+        for k in range(n_modes):
+            ar = ylm_real[k]
+            ai = ylm_imag[k]
+            mr = modes_real[k, j]
+            mi = modes_imag[k, j]
+            hr += ar * mr - ai * mi
+            hi += ar * mi + ai * mr
+        h_real[j] = hr
+        h_imag[j] = hi
+
+    return h_real, h_imag
+
+
+def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, **kwargs: Any) -> dict[str, np.ndarray]:
+    """Generic waveform generator function for DANSur-compatible surrogate models.
+
+    Intended to be partially applied with a specific model instance::
+
+        gen_func = partial(model_gen_func, my_model)
+
+    Parameters
+    ----------
+    model:
+        A loaded :class:`DANSur` (or compatible) surrogate instance.
+    times:
+        Time array in seconds. If ``None``, a default 3 s grid at 1024 Hz is used.
+    **kwargs:
+        Bilby-style GW parameters (chirp_mass, mass_ratio, chi_1, chi_2,
+        luminosity_distance, theta_jn, phase, geocent_time, ra, dec, psi, …).
+        May also contain a ``'parameters'`` key wrapping a sub-dict, which bilby
+        sometimes injects.
+
+    Returns
+    -------
+    dict with keys ``'plus'`` and ``'cross'`` (real float64 arrays).
+    """
+    if len(kwargs) == 0:
+        raise ValueError('model_gen_func received no parameters')
+
+    if times is None:
+        duration_local = 3.0
+        sampling_frequency_local = 1024.0
+        times_arr = np.arange(0, duration_local, 1.0 / sampling_frequency_local)
+    else:
+        times_arr = times
+        dt = times_arr[1] - times_arr[0]
+        duration_local = len(times_arr) * dt
+        sampling_frequency_local = 1.0 / dt
+
+    if 'parameters' in kwargs:
+        kwargs = kwargs['parameters']
+
+    converted_params = bilby.gw.conversion.convert_to_lal_binary_black_hole_parameters(kwargs)[0]
+    out = dansur_convert(times_arr, **converted_params)
+
+    # 1. Generate modes (inclination=None)
+    out_no_inc: dict[str, Any] = out.copy()
+    out_no_inc['inclination'] = None
+    out_no_inc['phi_ref'] = 0.0
+    out_no_inc['f_low'] = 0.0
+
+    # ensure mass ratio by convention is 0<q<=1
+    out_no_inc['q'] = out_no_inc['q'] if out_no_inc['q'] <= 1 else 1 / out_no_inc['q']
+
+    # Evaluate full surrogate waveform on its innate domain
+    out_no_inc['times'] = None
+    domain_full, h_modes_full, _ = model(**out_no_inc)
+    # Calculate times relative to a fixed merger epoch to avoid GPS time-scale errors.
+    # We ignore the sampled geocent_time in kwargs for grid definition.
+    post_trig = domain_full[-1]
+    t_merger = float(times_arr[0]) + duration_local - post_trig
+    times_relative = times_arr - t_merger
+
+    # Interpolate each mode onto the user's times_relative
+    h_modes: dict[tuple[int, int], np.ndarray] = {}
+    for mode, hlm in h_modes_full.items():
+        h_modes[mode] = np.interp(times_relative, domain_full, hlm, left=0, right=0)
+
+    # Re-apply PN relative-phase offsets between modes.
+    # The surrogate network predicts mode amplitudes and phases independently;
+    # their relative phases must be consistent with PN theory at early times
+    # (inspiral). We compute the initial characteristic velocity v0 from the
+    # (2,2) phase gradient on the full (pre-interpolation) surrogate domain,
+    # then rotate each mode h_lm -> h_lm * exp(i * xi_lm) where
+    # xi_lm = arg(H_lm^PN(v0)) is the PN complex-amplitude phase.
+    # The (2,2) mode is the gauge reference (xi_22 = 0 by definition).
+    # This step must happen BEFORE the peak-phase alignment below, because
+    # that alignment applies a mode-dependent rotation exp(-i * m/2 * phi22_peak)
+    # which *preserves* relative phases under the coorbital-frame convention.
+    h22_full = h_modes_full[(2, 2)]
+    if len(h22_full) >= 2:
+        dt_full = float(domain_full[1] - domain_full[0])
+        phi0 = float(np.angle(h22_full[0]))
+        phi1 = float(np.angle(h22_full[1]))
+        v0_pn = _numba_compute_v0(phi0, phi1, dt_full)
+    else:
+        v0_pn = 0.0
+
+    q_val    = float(out_no_inc['q'])
+    chi1_val = float(out_no_inc['chiA0']) if np.ndim(out_no_inc['chiA0']) == 0 else float(out_no_inc['chiA0'][-1])
+    chi2_val = float(out_no_inc['chiB0']) if np.ndim(out_no_inc['chiB0']) == 0 else float(out_no_inc['chiB0'][-1])
+
+    # Ensure q >= 1 for get_pn_amplitude (it uses q = m1/m2 >= 1)
+    q_pn = q_val if q_val >= 1.0 else 1.0 / q_val
+
+    if v0_pn > 0.0:
+        xi_lm: dict[tuple[int, int], float] = {}
+        for (l, m) in h_modes.keys():
+            if l == 2 and m == 2:
+                xi_lm[(l, m)] = 0.0
+            else:
+                H_lm_pn = model.get_pn_amplitude(l, m, v0_pn, q_pn, chi1_val, chi2_val)
+                xi_lm[(l, m)] = float(np.angle(H_lm_pn)) if H_lm_pn != 0j else 0.0
+        h_modes = {
+            mode: hlm * np.exp(1j * xi_lm[mode])
+            for mode, hlm in h_modes.items()
+        }
+
+    # Stack modes into contiguous arrays for Numba kernels.
+    # Mode order is fixed by dict insertion order (Python 3.7+).
+    mode_list_ordered: list[tuple[int, int]] = list(h_modes.keys())
+    n_modes = len(mode_list_ordered)
+    n_samples = len(times_arr)
+    modes_real = np.empty((n_modes, n_samples), dtype=np.float64)
+    modes_imag = np.empty((n_modes, n_samples), dtype=np.float64)
+    m_vals = np.empty(n_modes, dtype=np.int64)
+    for k, (l, m) in enumerate(mode_list_ordered):
+        modes_real[k] = h_modes[(l, m)].real
+        modes_imag[k] = h_modes[(l, m)].imag
+        m_vals[k] = m
+
+    # peak_idx: index of merger in times_relative (closest to t=0)
+    peak_idx: int = int(np.argmin(np.abs(times_relative)))
+
+    # Need phi22_peak to pass to the fused kernel, but it depends on the
+    # h22 value AFTER taper+roll. We do a quick pre-roll on h22 only to get
+    # phi22_peak, then pass it into the full fused kernel.
+    # This is cheaper than splitting into separate passes.
+    h22_idx = next(i for i, (l, m) in enumerate(mode_list_ordered) if l == 2 and m == 2)
+    h22_r_tmp = modes_real[h22_idx].copy()
+    h22_i_tmp = modes_imag[h22_idx].copy()
+    h22_r_tmp, h22_i_tmp = _numba_taper_complex(h22_r_tmp, h22_i_tmp)
+    n = n_samples
+    roll_by_mod = peak_idx % n
+    h22_r_peak = h22_r_tmp[roll_by_mod]
+    h22_i_peak = h22_i_tmp[roll_by_mod]
+    phi22_peak: float = float(np.arctan2(h22_i_peak, h22_r_peak))
+
+    # Fused kernel: taper + cyclic roll + phase alignment for all modes.
+    # Phase alignment rotates mode (l,m) by exp(-i*(m/2)*phi22_peak),
+    # zeroing the (2,2) peak phase while preserving relative inter-mode phases.
+    out_r, out_i = _numba_taper_roll_align_modes(
+        modes_real.copy(), modes_imag.copy(),
+        peak_idx, m_vals, phi22_peak
+    )
+
+    # Perform the mode sum: h = sum_{l,m} Y_{l,m}(theta, phi) * h_{l,m}.
+    # DANSur.__call__ with inclination=None already inserts (l,-m) modes into
+    # the returned dict via equatorial symmetry, so h_modes contains both +m
+    # and -m entries. We therefore use fake_neg_modes=False (plain sum), which
+    # is what the original _mode_sum call did. sYlm scalars are constant for
+    # fixed (theta_jn, phi_ref) and precomputed here to stay out of Numba.
+    theta_jn = float(out['inclination'])
+    phase = float(out['phi_ref'])
+    phi_eval = float(np.pi / 2.0 - phase)  # LAL convention
+    ylm_r = np.empty(n_modes)
+    ylm_i = np.empty(n_modes)
+    for k, (l, m) in enumerate(mode_list_ordered):
+        y = _sYlm(-2, l, m, theta_jn, phi_eval)
+        ylm_r[k] = y.real
+        ylm_i[k] = y.imag
+
+    h_real, h_imag = _numba_mode_sum_from_precomputed(
+        out_r, out_i,
+        ylm_r, ylm_i,
+    )
+
+    return {"plus": h_real, "cross": h_imag}
+
 
 # Setup paths relative to the script's directory for portability
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
