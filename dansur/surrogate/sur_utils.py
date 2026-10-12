@@ -53,7 +53,8 @@ def _numba_get_pn_amplitude(l, m, v, q, chi1z=0.0, chi2z=0.0):
             c_1 = -(4.0 / 9.0) * np.sqrt(10.0 / 7.0) * (1.0 - 3.0 * nu)
             H_lm = c_1 * x
         elif m == 3:
-            c_1_5 = 1j * (9.0 / 4.0) * np.sqrt(1.0 / 70.0) * delta * (1.0 - 2.0 * nu)
+            # -i: with +i the (4,3) mode is out of phase with NRHybSur3dq8 and SXS
+            c_1_5 = -1j * (9.0 / 4.0) * np.sqrt(1.0 / 70.0) * delta * (1.0 - 2.0 * nu)
             H_lm = c_1_5 * x**1.5
         elif m == 2:
             c_2 = (1.0 / 63.0) * np.sqrt(2.0) * (1.0 - 7.0 * nu + 13.0 * nu**2)
