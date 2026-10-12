@@ -79,25 +79,6 @@ def _numba_taper_start(data):
 
 
 @numba.njit
-def _numba_compute_v0(phase_0: float, phase_1: float, dt: float) -> float:
-    """Compute initial characteristic velocity v0 = (omega_orb)^(1/3)
-    from two consecutive (2,2)-mode phase samples.
-    
-    omega_22 = d(phi_22)/dt  =>  omega_orb = omega_22 / 2
-    v0 = omega_orb^(1/3)
-    
-    Takes the absolute value of omega_22 to guard against sign conventions.
-    Returns a real, positive v0.
-    """
-    omega_22 = (phase_1 - phase_0) / dt
-    if omega_22 < 0.0:
-        omega_22 = -omega_22
-    omega_orb = omega_22 / 2.0
-    # cube root via exponentiation
-    return omega_orb ** (1.0 / 3.0)
-
-
-@numba.njit
 def _numba_taper_complex(data_real, data_imag):
     """Taper both real and imaginary parts of a complex mode in one pass.
     Equivalent to two calls of _numba_taper_start but avoids redundant
@@ -304,45 +285,8 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
     for mode, hlm in h_modes_full.items():
         h_modes[mode] = np.interp(times_relative, domain_full, hlm, left=0, right=0)
 
-    # Re-apply PN relative-phase offsets between modes.
-    # The surrogate network predicts mode amplitudes and phases independently;
-    # their relative phases must be consistent with PN theory at early times
-    # (inspiral). We compute the initial characteristic velocity v0 from the
-    # (2,2) phase gradient on the full (pre-interpolation) surrogate domain,
-    # then rotate each mode h_lm -> h_lm * exp(i * xi_lm) where
-    # xi_lm = arg(H_lm^PN(v0)) is the PN complex-amplitude phase.
-    # The (2,2) mode is the gauge reference (xi_22 = 0 by definition).
-    # This step must happen BEFORE the peak-phase alignment below, because
-    # that alignment applies a mode-dependent rotation exp(-i * m/2 * phi22_peak)
-    # which *preserves* relative phases under the coorbital-frame convention.
-    h22_full = h_modes_full[(2, 2)]
-    if len(h22_full) >= 2:
-        dt_full = float(domain_full[1] - domain_full[0])
-        phi0 = float(np.angle(h22_full[0]))
-        phi1 = float(np.angle(h22_full[1]))
-        v0_pn = _numba_compute_v0(phi0, phi1, dt_full)
-    else:
-        v0_pn = 0.0
-
-    q_val    = float(out_no_inc['q'])
-    chi1_val = float(out_no_inc['chiA0']) if np.ndim(out_no_inc['chiA0']) == 0 else float(out_no_inc['chiA0'][-1])
-    chi2_val = float(out_no_inc['chiB0']) if np.ndim(out_no_inc['chiB0']) == 0 else float(out_no_inc['chiB0'][-1])
-
-    # Ensure q >= 1 for get_pn_amplitude (it uses q = m1/m2 >= 1)
-    q_pn = q_val if q_val >= 1.0 else 1.0 / q_val
-
-    if v0_pn > 0.0:
-        xi_lm: dict[tuple[int, int], float] = {}
-        for (l, m) in h_modes.keys():
-            if l == 2 and m == 2:
-                xi_lm[(l, m)] = 0.0
-            else:
-                H_lm_pn = model.get_pn_amplitude(l, m, v0_pn, q_pn, chi1_val, chi2_val)
-                xi_lm[(l, m)] = float(np.angle(H_lm_pn)) if H_lm_pn != 0j else 0.0
-        h_modes = {
-            mode: hlm * np.exp(1j * xi_lm[mode])
-            for mode, hlm in h_modes.items()
-        }
+    # The PN relative-phase offsets between the modes are already applied by
+    # DANSur.__call__; applying them here again would double them.
 
     # Stack modes into contiguous arrays for Numba kernels.
     # Mode order is fixed by dict insertion order (Python 3.7+).
@@ -360,26 +304,14 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
     # peak_idx: index of merger in times_relative (closest to t=0)
     peak_idx: int = int(np.argmin(np.abs(times_relative)))
 
-    # Need phi22_peak to pass to the fused kernel, but it depends on the
-    # h22 value AFTER taper+roll. We do a quick pre-roll on h22 only to get
-    # phi22_peak, then pass it into the full fused kernel.
-    # This is cheaper than splitting into separate passes.
-    h22_idx = next(i for i, (l, m) in enumerate(mode_list_ordered) if l == 2 and m == 2)
-    h22_r_tmp = modes_real[h22_idx].copy()
-    h22_i_tmp = modes_imag[h22_idx].copy()
-    h22_r_tmp, h22_i_tmp = _numba_taper_complex(h22_r_tmp, h22_i_tmp)
-    n = n_samples
-    roll_by_mod = peak_idx % n
-    h22_r_peak = h22_r_tmp[roll_by_mod]
-    h22_i_peak = h22_i_tmp[roll_by_mod]
-    phi22_peak: float = float(np.arctan2(h22_i_peak, h22_r_peak))
-
-    # Fused kernel: taper + cyclic roll + phase alignment for all modes.
-    # Phase alignment rotates mode (l,m) by exp(-i*(m/2)*phi22_peak),
-    # zeroing the (2,2) peak phase while preserving relative inter-mode phases.
+    # Fused kernel: taper + cyclic roll, without the peak-phase rotation. The
+    # modes of DANSur.__call__ already have a well-defined frame (phases fixed at
+    # the start of the window); rotating by exp(-i*(m/2)*arg h22(peak)), with
+    # arg wrapped to (-pi, pi], flips the sign of the odd-m modes wherever the
+    # peak phase crosses +-pi, i.e. many times across parameter space.
     out_r, out_i = _numba_taper_roll_align_modes(
         modes_real.copy(), modes_imag.copy(),
-        peak_idx, m_vals, phi22_peak
+        peak_idx, m_vals, 0.0
     )
 
     # Perform the mode sum: h = sum_{l,m} Y_{l,m}(theta, phi) * h_{l,m}.
@@ -587,8 +519,10 @@ class SXSInjection:
             assert isinstance(waveform, h5py.Group)
             for mode_str in waveform.keys():
                 mode_tuple = ast.literal_eval(mode_str)
-                # wf_mode
-                self.modes_data[mode_tuple] = waveform[mode_str][()]
+                # The SXS catalogue strain has the opposite overall sign to the
+                # LAL/NRHybSur3dq8 convention of the templates (sign change in
+                # the 2019 catalogue); without the flip, psi is recovered at psi + pi/2.
+                self.modes_data[mode_tuple] = -waveform[mode_str][()]
         
         if (2, 2) not in self.modes_data:
             raise ValueError("SXS waveform must contain the (2, 2) mode.")
@@ -636,7 +570,11 @@ def main() -> None:
     parser.add_argument("--inj-dec", type=float, default=-0.4, help="Injection declination dec (rad)")
     parser.add_argument("--inj-geocent-time", type=float, default=1126259642.413, help="Injection GPS geocenter time")
     
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (same seed, same noise realisation)")
+
     args, _ = parser.parse_known_args()
+    if args.seed is not None:
+        bilby.core.utils.random.seed(args.seed)
     
     duration: float = 4
     sampling_frequency: int = 1024*2
@@ -774,7 +712,7 @@ def main() -> None:
         waveform_arguments=waveform_arguments,
     )
 
-    model_path = os.path.join(PROJECT_ROOT, 'models/rolling/DANSur_HM_jitted.pt')
+    model_path = os.path.join(PROJECT_ROOT, 'models/DANSur_HM_jitted.pt')
     dansur = DANSur(path=model_path, modes_list=modes)
 
     # dansur_gen_func is a thin wrapper around model_gen_func with `dansur` pre-bound.
