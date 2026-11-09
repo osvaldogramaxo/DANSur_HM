@@ -13,7 +13,7 @@ Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
 **Try it in 30 seconds:**
 
 ```bash
-pip install "dansur-hm @ git+https://github.com/osvaldogramaxo/DANSur_HM"
+pip install dansur-hm
 ```
 
 ```python
@@ -91,9 +91,6 @@ Extras add what the rest of the repository needs:
 | `pip install dansur-hm` | Evaluating waveforms |
 | `pip install "dansur-hm[bilby]"` | The bilby source model (adds bilby, lalsuite) |
 | `pip install "dansur-hm[train]"` | Training, evaluation and PE scripts in `scripts/` |
-
-Until the package is on PyPI, install from GitHub:
-`pip install "dansur-hm[bilby] @ git+https://github.com/osvaldogramaxo/DANSur_HM"`.
 
 > **Note:** `gwsurrogate` is distributed as source only, so installation needs a C compiler
 > (available on Linux, macOS with Xcode tools, and Colab).
