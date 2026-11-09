@@ -5,7 +5,9 @@ quasi-circular, aligned-spin binary black hole mergers, including
 higher-order spherical harmonic modes. Follow up to [arXiv:2412.06946](https://arxiv.org/abs/2412.06946), where only the (2,2) mode was considered.
 
 Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
+
 [![DOI](https://zenodo.org/badge/1359189927.svg)](https://doi.org/10.5281/zenodo.24081382)
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/osvaldogramaxo/DANSur_HM/blob/main/examples/quickstart.ipynb)
 
 **Try it in 30 seconds:**
