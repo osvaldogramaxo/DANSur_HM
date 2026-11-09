@@ -6,6 +6,21 @@ higher-order spherical harmonic modes. Follow up to [arXiv:2412.06946](https://a
 
 Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/osvaldogramaxo/DANSur_HM/blob/main/examples/quickstart.ipynb)
+
+**Try it in 30 seconds:**
+
+```bash
+pip install "dansur-hm @ git+https://github.com/osvaldogramaxo/DANSur_HM"
+```
+
+```python
+from dansur import DANSur
+t, h_modes, _ = DANSur()(q=3.0, chiA0=0.3, chiB0=-0.1)   # trained model is bundled
+```
+
+Or open the [quickstart notebook](examples/quickstart.ipynb) in Colab — no install needed.
+
 ## Overview
 
 **DANSur_HM** is a two-stage neural network approximant:
@@ -33,7 +48,9 @@ Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
 ```
 .
 ├── dansur/                          # Main Python package
+│   ├── bilby_source.py             # bilby source model (dansur_binary_black_hole)
 │   ├── surrogate/
+│   │   ├── DANSur_HM_jitted.pt     # Trained TorchScript model (~41 MB), bundled
 │   │   ├── sur_utils.py            # DANSur evaluator class (inference)
 │   │   ├── waveform_generation.py  # Waveform generation utilities (22-mode)
 │   │   └── waveform_generation_HM.py  # Waveform generation (higher-mode)
@@ -53,9 +70,8 @@ Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
 │   ├── calculate_sxs_mismatches.py  # Evaluate model against SXS catalog
 │   ├── bilby_run_injection.py       # GW parameter estimation (injection tests)
 │   └── config.yaml                  # Training configuration
-├── models/
-│   └── DANSur_HM_jitted.pt         # Trained TorchScript model (~41 MB)
 ├── examples/
+│   ├── quickstart.ipynb            # Colab notebook: modes, strain, batches, bilby
 │   └── waveform_example.py         # Minimal usage example
 ├── pyproject.toml
 └── LICENSE
@@ -65,29 +81,27 @@ Results published in: [arXiv:2609.03025](https://arxiv.org/abs/2609.03025)
 
 ## Setup
 
-### Using `uv` (recommended)
+The base install covers waveform evaluation (torch, numpy, numba, gwsurrogate).
+Extras add what the rest of the repository needs:
+
+| Install | For |
+|---|---|
+| `pip install dansur-hm` | Evaluating waveforms |
+| `pip install "dansur-hm[bilby]"` | The bilby source model (adds bilby, lalsuite) |
+| `pip install "dansur-hm[train]"` | Training, evaluation and PE scripts in `scripts/` |
+
+Until the package is on PyPI, install from GitHub:
+`pip install "dansur-hm[bilby] @ git+https://github.com/osvaldogramaxo/DANSur_HM"`.
+
+> **Note:** `gwsurrogate` is distributed as source only, so installation needs a C compiler
+> (available on Linux, macOS with Xcode tools, and Colab).
+
+### Development install
 
 ```bash
-# Install uv if not already available
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create virtual environment and install all dependencies
-uv sync
-
-# Activate
-source .venv/bin/activate
+git clone https://github.com/osvaldogramaxo/DANSur_HM && cd DANSur_HM
+uv sync --extra train      # or: pip install -e ".[train]"
 ```
-
-### Using `pip`
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-> **Note:** `lalsuite` installation may require system-level LIGO dependencies.
-> See the [LALSuite documentation](https://lscsoft.docs.ligo.org/lalsuite/) for details.
 
 ---
 
@@ -97,29 +111,54 @@ pip install -e .
 
 ```python
 import numpy as np
-from dansur.surrogate import DANSur
+from dansur import DANSur
 
-modes = [(2, 2), (3, 3), (2, 1), (4, 4), (3, 2), (5, 5), (4, 3)]
-sur = DANSur(path="models/DANSur_HM_jitted.pt", modes_list=modes)
+sur = DANSur()   # bundled model; DANSur(device="cuda") runs the network on a GPU
 
-# Binary parameters
-q     = 3.0   # mass ratio (m1/m2 >= 1)
-chi1z = 0.3   # spin of heavier BH
-chi2z = -0.1  # spin of lighter BH
+q, chi1z, chi2z = 3.0, 0.3, -0.1   # q = m1/m2 >= 1, aligned spins
+times = np.arange(-3996, 100, 0.5)  # geometric units (M), peak at t = 0
 
-# Time array in geometric units (M)
-times = np.arange(-3996, 100, 0.5)
+# Modes: returns (times, {(l, m): complex h_lm}, None), including m < 0
+t, h_modes, _ = sur(q=q, chiA0=chi1z, chiB0=chi2z, times=times)
+print(h_modes[(3, 3)].shape)   # (8192,)
 
-# Generate waveform (returns: hp, hc, h_modes dict)
-hp, hc, h_modes = sur(
-    q=q, chiA0=chi1z, chiB0=chi2z,
-    inclination=np.pi/4, mode_list=modes, times=times,
-)
-print(h_modes[(2, 2)].shape)  # e.g. (8192,)
+# Strain h = h+ - i hx at a given inclination, in physical units
+t_s, h, _ = sur(q=q, chiA0=chi1z, chiB0=chi2z, M=60.0, dist_mpc=500.0, units="mks",
+                times=np.arange(-1.0, 0.03, 1 / 4096), inclination=np.pi / 4, phi_ref=0.0)
+hp, hc = h.real, -h.imag
 ```
 
-See [`examples/waveform_example.py`](examples/waveform_example.py) for a
-complete runnable script with plotting.
+**Batches:** pass arrays of `q` and spins as `(N, 3)` vectors with zero in-plane
+components (e.g. `np.stack([zeros, zeros, chi1z], -1)`); outputs then have shape `(N, n_times)`.
+
+**GPU:** with `DANSur(device="cuda")` the network and all post-processing run on the GPU,
+in chunks of 1024 waveforms; only the final arrays are copied back. Strain for 10,000
+waveforms takes ~1.4 s on a V100 vs ~7 s on 32 CPU cores. A single waveform takes ~20 ms
+and is fastest on CPU, so prefer the CPU for one-at-a-time use such as bilby sampling.
+
+See [`examples/waveform_example.py`](examples/waveform_example.py) for a runnable script
+with plotting, and [`examples/quickstart.ipynb`](examples/quickstart.ipynb) for a notebook.
+
+### Using DANSur_HM in bilby
+
+Requires the `bilby` extra.
+
+```python
+import bilby
+from dansur.bilby_source import dansur_binary_black_hole
+
+waveform_generator = bilby.gw.WaveformGenerator(
+    duration=4, sampling_frequency=2048,
+    time_domain_source_model=dansur_binary_black_hole,
+    parameter_conversion=bilby.gw.conversion.convert_to_lal_binary_black_hole_parameters,
+)
+```
+
+Use it like any other bilby waveform generator (sample in `chirp_mass`/`mass_ratio` or
+`mass_1`/`mass_2`, with aligned spins `chi_1`, `chi_2`). Polarizations follow the LAL
+convention. The waveform covers about 4000 M before merger, so the (2,2) mode starts at
+roughly 18 Hz × (70 M☉ / M); pick the analysis minimum frequency above that.
+To use a different model instance, call `dansur.bilby_source.model_gen_func(model, times, **params)`.
 
 ---
 
@@ -197,7 +236,7 @@ After training, export the model for fast inference:
 ```bash
 python -m dansur.training.jit_model \
     --config scripts/config.yaml \
-    --output-path models/DANSur_HM_jitted.pt
+    --output-path dansur/surrogate/DANSur_HM_jitted.pt
 ```
 
 ---
@@ -209,7 +248,6 @@ Compute mismatches of DANSur_HM and NRHybSur3dq8 against the SXS catalog:
 ```bash
 python scripts/calculate_sxs_mismatches.py \
     --sxs-file /path/to/sxs_waveforms.h5 \
-    --model-path models/DANSur_HM_jitted.pt \
     --out-dir plots/
 ```
 

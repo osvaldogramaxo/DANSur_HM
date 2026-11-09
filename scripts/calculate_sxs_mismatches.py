@@ -76,7 +76,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Calculate mismatches against SXS dataset.")
     parser.add_argument("--sxs-file", type=str, default="../sxs/sxs_waves_allmodes_8192.h5", help="Path to SXS HDF5 file.")
-    parser.add_argument("--model-path", type=str, default="models/rolling/DANSur_HM_jitted.pt", help="Path to JIT model.")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to JIT model (default: the bundled DANSur_HM model).")
     parser.add_argument("--out-dir", type=str, default="plots", help="Output directory.")
     parser.add_argument("--num-waveforms", type=int, default=None, help="Limit number of waveforms (for testing).")
     args = parser.parse_args()
@@ -115,7 +115,7 @@ def main():
     ds.waveform_data = abs(ds.waveform_data) * np.exp(1j * get_phases(torch.tensor(ds.waveform_data)).numpy())
         
     # 3. Load Models
-    print(f"Loading DANSur from {args.model_path}...")
+    print(f"Loading DANSur from {args.model_path or 'bundled model'}...")
     dansur = DANSur(path=args.model_path, modes_list=modes)
     
     print("Loading NRHybSur3dq8...")

@@ -1,5 +1,6 @@
-from re import S
-import gwsurrogate
+# gwsurrogate must be imported before torch: the other order shifts CPU outputs by
+# ~5e-5 relative (even with MKL_CBWR pinned). This order reproduces the published results.
+import gwsurrogate  # noqa: F401
 import torch
 import os
 import warnings
@@ -9,7 +10,6 @@ import numpy as np
 import numba
 from gwtools import gwutils as _gwutils
 from gwsurrogate import SurrogateEvaluator
-from matplotlib import pyplot as plt
 from typing import Any
 # from gwsurrogate.surrogate import EvaluateSingleModeSurrogate
 # from EvaluateSingleModeSurrogate import adjust_merger_phase
@@ -77,97 +77,15 @@ def _numba_get_pn_amplitude_batch(l, m, v, q, chi1z, chi2z):
         out[i] = _numba_get_pn_amplitude(l, m, v[i], q[i], chi1z[i], chi2z[i])
     return out
 
-@numba.njit(parallel=True)
-def _numba_planck_taper_end_batch(domain, h_real, h_imag, taper_duration):
-    batch, wave_len = h_real.shape
-    tol = 0.005
-    for i in numba.prange(batch):
-        t_end = domain[i, -1]
-        for j in range(wave_len):
-            t = domain[i, j]
-            val = (t_end - t) / taper_duration
-            if val < tol:
-                sigma = 0.0
-            elif val > 1.0 - tol:
-                sigma = 1.0
-            else:
-                z = 1.0 / val - 1.0 / (1.0 - val)
-                sigma = 1.0 / (np.exp(z) + 1.0)
-            h_real[i, j] *= sigma
-            h_imag[i, j] *= sigma
-
-@numba.njit(parallel=True)
-def _numba_mode_sum_batch(
-    modes_r, modes_i,
-    ylm_r, ylm_i,
-    neg_ylm_r, neg_ylm_i,
-    ell_vals, m_vals,
-    fake_neg_modes
-):
-    n_modes, batch, wave_len = modes_r.shape
-    out_r = np.zeros((batch, wave_len))
-    out_i = np.zeros((batch, wave_len))
-    
-    for i in numba.prange(batch):
-        for j in range(wave_len):
-            hr = 0.0
-            hi = 0.0
-            for k in range(n_modes):
-                l = ell_vals[k]
-                m = m_vals[k]
-                
-                # +m mode contribution
-                ar = ylm_r[k]
-                ai = ylm_i[k]
-                mr = modes_r[k, i, j]
-                mi = modes_i[k, i, j]
-                hr += ar * mr - ai * mi
-                hi += ar * mi + ai * mr
-                
-                # -m mode contribution via symmetry
-                if fake_neg_modes and m > 0:
-                    sign = 1.0 if (l % 2 == 0) else -1.0
-                    br = neg_ylm_r[k] * sign
-                    bi = neg_ylm_i[k] * sign
-                    # conj(h_lm) = (mr, -mi)
-                    hr += br * mr + bi * mi
-                    hi += -br * mi + bi * mr
-            out_r[i, j] = hr
-            out_i[i, j] = hi
-            
-    return out_r, out_i
-
-@numba.njit(parallel=True)
-def _numba_interp_batch(times, domains, waveforms_real, waveforms_imag):
-    batch, wave_len = waveforms_real.shape
-    n_target = len(times)
-    out_real = np.empty((batch, n_target), dtype=np.float64)
-    out_imag = np.empty((batch, n_target), dtype=np.float64)
-    for i in numba.prange(batch):
-        out_real[i] = np.interp(times, domains[i], waveforms_real[i])
-        out_imag[i] = np.interp(times, domains[i], waveforms_imag[i])
-        
-        # Zero out extrapolation regions (equivalent to left=0, right=0)
-        t_min = domains[i, 0]
-        t_max = domains[i, -1]
-        for j in range(n_target):
-            t = times[j]
-            if t < t_min or t > t_max:
-                out_real[i, j] = 0.0
-                out_imag[i, j] = 0.0
-                
-    return out_real, out_imag
-
 class DANSur(SurrogateEvaluator):
 
 
     def __init__(self, modes_list = [(2, 2), (3, 3), (2, 1), (4, 4), (3, 2), (5, 5), (4, 3)], device='cpu', path=None):
         """
-        gwsurrogate wrapper for the NRSurNN3dq8. Intrinsic parameters are mass ratio (q) and spins (chiA0, chiB0).  
-        This model accepts batch inputs for the input parameters, so q can be a float or np.ndarray of shape (N,), where N is the batch size.
-        Since this model is non-precessing, only the z-components of the spins should exist. As such, while chiA0 and chiB0 can be of the type [0., 0., chiz],
-        following gwsurrogate convention, the user can pass only the z-components of the spins as a float or np.ndarray of shape (N,). The output is a dictionary
-        of the waveform modes, where the keys are the mode tuple (l, m) and the values are the complex numpy arrays of the waveform modes, of shape (N, 2048).
+        gwsurrogate-style wrapper for DANSur_HM. Intrinsic parameters are mass ratio (q) and aligned spins (chiA0, chiB0).
+        Single waveforms: q, chiA0, chiB0 are floats (or spins as [0, 0, chiz]).
+        Batches: q of shape (N,) and spins of shape (N, 3) with zero in-plane components; outputs then have shape (N, n_times).
+        device: torch device for the network and all post-processing (e.g. 'cuda'); results are returned as numpy arrays.
         """
         self.name = 'DANSur'
         self.device = device
@@ -342,68 +260,94 @@ class DANSur(SurrogateEvaluator):
                 
         return phase_offsets
 
-    def _mode_sum(self, h_modes, theta, phi, fake_neg_modes=False):
+    def _evaluate_chunk(self, x, q, t_scale, amp_scale, inclination, phi_ref,
+                        times, taper_end_duration):
+        """Network evaluation and post-processing of one batch chunk, in torch on self.device.
+
+        Follows the dtypes of the original numpy implementation: complex64 network
+        output, float64/complex128 from the phase alignment on.
+        Returns (domain, h) as torch tensors on self.device; domain is None if
+        `times` is given, h is the strain if `inclination` is given, else a dict of modes.
         """
-        Numba-optimized mode sum for a batch of waveforms.
-        """
-        first_mode_data = next(iter(h_modes.values()))
-        if first_mode_data.ndim == 1:
-            is_1d = True
-            batch = 1
-            wave_len = len(first_mode_data)
+        dev = self.device
+        n = x.shape[0]
+        h = self._sur_dimless(x.to(dev))  # (n, n_modes, L), complex64
+        L = h.shape[-1]
+        modes = [tuple(mode) for mode in self.modes_list]
+
+        # Time grid in M, shifted so the peak of sum_lm |h_lm|^2 is at t = 0
+        base = torch.arange(-4096 + 100, 100, 4096 / L, dtype=torch.float64, device=dev)
+        l2_norm_sq = torch.zeros(n, L, dtype=torch.float64, device=dev)
+        for k in range(len(modes)):
+            l2_norm_sq += (h[:, k].abs() ** 2).double()
+        peak_idx = l2_norm_sq.argmax(dim=-1)
+        domain = base - base[peak_idx][:, None]
+
+        # Phase of each mode relative to (2,2) from PN amplitudes at the initial velocity
+        angle_22 = torch.angle(h[:, modes.index((2, 2)), :2])
+        omega_22 = (angle_22[:, 1] - angle_22[:, 0]).double() / (domain[:, 1] - domain[:, 0])
+        v0 = ((omega_22 / 2.0) ** (1.0 / 3.0)).cpu().numpy()
+        h_modes = {}
+        for k, (l, m) in enumerate(modes):
+            hlm = h[:, k].conj().to(torch.complex128)
+            if (l, m) != (2, 2):
+                H_lm = self.get_pn_amplitude(l, m, v0, q.numpy(), x[:, 1].numpy(), x[:, 2].numpy())
+                hlm = hlm * torch.exp(1j * torch.as_tensor(np.angle(H_lm), device=dev))[:, None]
+            h_modes[(l, m)] = hlm
+
+        # Planck taper over the last taper_end_duration M
+        if taper_end_duration is not None:
+            tol = 0.005
+            val = (domain[:, -1:] - domain) / taper_end_duration
+            v = val.clamp(tol, 1.0 - tol)
+            sigma = 1.0 / (torch.exp(1.0 / v - 1.0 / (1.0 - v)) + 1.0)
+            sigma = torch.where(val < tol, 0.0, torch.where(val > 1.0 - tol, 1.0, sigma))
+            h_modes = {mode: hlm * sigma for mode, hlm in h_modes.items()}
+
+        if inclination is not None:
+            # Strain h = h+ - i hx at (inclination, pi/2 - phi_ref), LAL convention;
+            # for nonprecessing systems the m<0 modes follow from equatorial symmetry
+            from gwsurrogate.surrogate import _sYlm
+            phi = np.pi / 2 - phi_ref
+            out = torch.zeros(n, L, dtype=torch.complex128, device=dev)
+            for (l, m), hlm in h_modes.items():
+                out += _sYlm(-2, l, m, inclination, phi) * hlm
+                if m > 0 and not self.keywords['Precessing']:
+                    out += (-1) ** l * _sYlm(-2, l, -m, inclination, phi) * hlm.conj()
         else:
-            is_1d = False
-            batch, wave_len = first_mode_data.shape
+            out = h_modes
+            if not self.keywords['Precessing']:
+                for (l, m) in list(h_modes):
+                    if m > 0 and (l, -m) not in h_modes:
+                        h_modes[(l, -m)] = (-1) ** l * h_modes[(l, m)].conj()
 
-        mode_list = list(h_modes.keys())
-        n_modes = len(mode_list)
-        
-        modes_r = np.empty((n_modes, batch, wave_len), dtype=np.float64)
-        modes_i = np.empty((n_modes, batch, wave_len), dtype=np.float64)
-        for k, mode in enumerate(mode_list):
-            data = h_modes[mode]
-            if is_1d:
-                modes_r[k, 0, :] = data.real
-                modes_i[k, 0, :] = data.imag
-            else:
-                modes_r[k, :, :] = data.real
-                modes_i[k, :, :] = data.imag
+        # Physical units
+        domain = domain * t_scale.to(dev)[:, None]
+        if amp_scale is not None:
+            a = amp_scale.to(dev)[:, None]
+            out = out * a if inclination is not None else {k: v * a for k, v in out.items()}
 
-        ylm_r = np.empty(n_modes)
-        ylm_i = np.empty(n_modes)
-        neg_ylm_r = np.empty(n_modes)
-        neg_ylm_i = np.empty(n_modes)
-        ell_vals = np.empty(n_modes, dtype=np.int64)
-        m_vals = np.empty(n_modes, dtype=np.int64)
-        
-        from gwsurrogate.surrogate import _sYlm
-        for k, (l, m) in enumerate(mode_list):
-            y = _sYlm(-2, l, m, theta, phi)
-            ylm_r[k] = y.real
-            ylm_i[k] = y.imag
-            ell_vals[k] = l
-            m_vals[k] = m
-            if fake_neg_modes and m > 0:
-                y_neg = _sYlm(-2, l, -m, theta, phi)
-                neg_ylm_r[k] = y_neg.real
-                neg_ylm_i[k] = y_neg.imag
-            else:
-                neg_ylm_r[k] = 0.0
-                neg_ylm_i[k] = 0.0
+        if times is None:
+            return domain, out
 
-        h_real, h_imag = _numba_mode_sum_batch(
-            modes_r, modes_i,
-            ylm_r, ylm_i,
-            neg_ylm_r, neg_ylm_i,
-            ell_vals, m_vals,
-            fake_neg_modes
-        )
-        
-        h_complex = h_real + 1j * h_imag
-        if is_1d:
-            return h_complex[0]
-        else:
-            return h_complex
+        # Linear interpolation onto `times` (as np.interp), zero outside each waveform
+        t = torch.as_tensor(times, dtype=torch.float64, device=dev).expand(n, -1).contiguous()
+        j_raw = torch.searchsorted(domain.contiguous(), t, right=True) - 1
+        j = j_raw.clamp(0, L - 2)
+        x0, x1 = domain.gather(1, j), domain.gather(1, j + 1)
+        inside = (t >= domain[:, :1]) & (t <= domain[:, -1:])
+        jj = j[..., None].expand(-1, -1, 2)
+
+        def interp(f):
+            f = torch.view_as_real(f)
+            f0, f1 = f.gather(1, jj), f.gather(1, jj + 1)
+            res = (f1 - f0) / (x1 - x0)[..., None] * (t - x0)[..., None] + f0
+            res = torch.where((j_raw == L - 1)[..., None], f[:, -1:], res)
+            res = torch.where(inside[..., None], res, 0.0)
+            return torch.view_as_complex(res.contiguous())
+
+        out = interp(out) if inclination is not None else {k: interp(v) for k, v in out.items()}
+        return None, out
 
     def _load_dimless_surrogate(self, path=None):
         """
@@ -419,8 +363,13 @@ class DANSur(SurrogateEvaluator):
         See NRHybSur3dq8 for an example.
         """
         if path is None:
-            path = os.path.dirname(__file__)+'/DANSur.pt'
+            path = os.path.join(os.path.dirname(__file__), 'DANSur_HM_jitted.pt')
         DANSurModel = torch.jit.load(path, map_location=self.device)
+        # The exported invPCA layers store the export device as a string and move
+        # their inputs and bases there on every call; map_location doesn't update it.
+        for module in DANSurModel.modules():
+            if hasattr(module, 'device'):
+                module.device = str(self.device)
         return DANSurModel
     def _get_intrinsic_parameters(self, q, chiA0, chiB0, precessing_opts,
             tidal_opts, par_dict):
@@ -909,154 +858,33 @@ class DANSur(SurrogateEvaluator):
         else:
             raise Exception('Invalid units')
 
-        # If f_ref is not given, we set it to f_low.
-        if f_ref is None:
-            f_ref = f_low
+        if dt is not None:
+            raise ValueError('dt is not supported; pass a uniform `times` array instead.')
 
-        # Get dimensionless step size or times/freqs and reference time/freq
-        dtM = None if dt is None else dt/t_scale
-        timesM = None if times is None else times/t_scale
-        dfM = None if df is None else df*t_scale
-        freqsM = None if freqs is None else freqs*t_scale
-        
+        t_scale = torch.as_tensor(np.broadcast_to(t_scale, q.shape), dtype=torch.float64)
+        amp_scale = (torch.as_tensor(np.broadcast_to(amp_scale, q.shape), dtype=torch.float64)
+                     if np.array(amp_scale != 1).any() else None)
 
-        # Get waveform modes and domain in dimensionless units
-        fM_low = f_low*t_scale
-        fM_ref = f_ref*t_scale
-        # print(x)
-        # print(x.shape)
-        h = self._sur_dimless(x).numpy()#.conj().resolve_conj().numpy()
-        # print(h.shape)
-        # plt.figure()
-        # plt.plot(h[0].T)
-        # plt.savefig('h_modes.png')
-        # h = self.to_wave(h).numpy()
-        # plt.figure()
-        # plt.plot(h[0].T)
-        # plt.savefig('h_modes_wave.png')
-        if DEBUG:
-            print('?'*50)
-            print(h.shape)
-            print('?'*50)
-        if len(h.shape) == 2:
-            h = {tuple(mode): h for mode in self.modes_list}
-        else:
-            h = {tuple(mode): h[:, i] for i, mode in enumerate(self.modes_list)}
-            
-        # Get the actual number of time samples from the waveform data
-        if isinstance(h, dict):
-            first_mode_data = next(iter(h.values()))
-            wave_len = first_mode_data.shape[-1] if first_mode_data.ndim > 0 else 1
-        else:
-            wave_len = h.shape[-1] if h.ndim > 0 else len(h)
-        # Build the dimensionless time domain for the surrogate output
-        dt_dimless = 4096 / wave_len
-        domain = np.tile(np.arange(-4096 + 100, 100, dt_dimless), (q.shape[0], 1))
-        
-        # Find the index of maximum amplitude in the total amplitude sum / L2 norm (merger time)
-        l2_norm_sq = np.zeros_like(domain)
-        for mode_data in h.values():
-            l2_norm_sq += np.abs(mode_data)**2
-        peak_idx = np.argmax(l2_norm_sq, axis=-1)
-        # Shift domain so that merger (peak) is at t=0
-        merger_time_dimless = domain[np.arange(q.shape[0]), peak_idx]
-        domain = domain - merger_time_dimless[:, None]
-        
-        # Adjust mode phases to post_newtonian approx based on (2,2) mode phase
-        h_22_raw = h[(2, 2)]
-        h_22_angle = np.angle(h_22_raw)
-        dt_initial = domain[:, 1] - domain[:, 0]
-        omega_22_initial = (h_22_angle[:, 1] - h_22_angle[:, 0]) / dt_initial
-        v0 = (omega_22_initial / 2.0) ** (1.0 / 3.0)
-
-        h_adjusted = {}
-        for mode in h.keys():
-            l, m = mode
-            if l == 2 and m == 2:
-                offset = np.zeros(q.shape[0])
-            else:
-                H_lm_complex = self.get_pn_amplitude(l, m, v0, q.numpy(), x[:, 1].numpy(), x[:, 2].numpy())
-                offset = np.angle(H_lm_complex)
-            h_adjusted[mode] = h[mode].conj() * np.exp(1j * offset)[:, None]
-        h = h_adjusted
-
-        # Align the merger phase of the (2,2) mode to 0.0
-        # h_22_amp = np.abs(h[(2, 2)])
-        # peak_idx = np.argmax(h_22_amp, axis=-1)
-        # phi_merger_22 = np.zeros(q.shape[0])
-        # for i in range(q.shape[0]):
-        #     unwrapped_phase = np.unwrap(np.angle(h[(2, 2)][i]))
-        #     phi_merger_22[i] = unwrapped_phase[peak_idx[i]]
-        # 
-        # phiadj = -phi_merger_22
-        # for mode in h.keys():
-        #     l, m = mode
-        #     h[mode] = h[mode] * np.exp(1j * (phiadj * (m / 2.0)))[:, None]
-        if DEBUG:
-            print('»'*50)
-            print(h[(2,2)])
-            print(h[(2,2)].shape)
-            print('»'*50)
-        # taper the last portion of the waveform, regardless of whether or not
-        # this corresponds to inspiral, merger, or ringdown.
-        if taper_end_duration is not None:
-            h_tapered = {}
-            for mode, hlm in h.items():
-                hr = hlm.real.copy()
-                hi = hlm.imag.copy()
-                _numba_planck_taper_end_batch(domain, hr, hi, taper_end_duration)
-                h_tapered[mode] = hr + 1j * hi
-            h = h_tapered
-
-        # sum over modes to get complex strain if inclination is given
-        if inclination is not None:
-            # For nonprecessing systems get the m<0 modes from the m>0 modes.
-            fake_neg_modes = not self.keywords['Precessing']
-
-            # Follows the LAL convention (see help text)
-            h = self._mode_sum(h, inclination, np.pi/2 - phi_ref,
-                    fake_neg_modes=fake_neg_modes)
-        else: # if returning modes, check if m<0 modes need to be generated for nonprecessing systems
-            if not self.keywords['Precessing']:
-                modes = list(h.keys())
-                for mode in modes:
-                    ell = mode[0]
-                    m   = mode[1]
-                    if (m > 0) and ( (ell,-m) not in h.keys()):
-                        h[(ell,-m)] = (-1)**ell * h[(ell,m)].conj()
-
-        # Rescale domain to physical units
-        if self._domain_type == 'Time':
-            domain = domain * t_scale[:, None]
-        elif self._domain_type == 'Frequency':
-            raise Exception("Don't know what to do with frequency domain")
-        else:
-            raise Exception('Invalid _domain_type.')
-
-        domain = domain.astype(float)
-
-        # Rescale waveform to physical units
-        if np.array(amp_scale != 1).any():
-            if isinstance(h, dict):
-                h = {k: v * amp_scale[:, None] for k, v in h.items()}
-            else:
-                h = h * amp_scale[:, None]
+        # Chunked so large batches fit in GPU memory; only final results leave the
+        # device, copied straight into preallocated CPU outputs
+        out = {}
+        for i in range(0, x.shape[0], 1024):
+            sl = slice(i, i + 1024)
+            domain_c, h_c = self._evaluate_chunk(
+                x[sl], q[sl], t_scale[sl], None if amp_scale is None else amp_scale[sl],
+                inclination, phi_ref, times, taper_end_duration)
+            parts = dict(h_c) if inclination is None else {'h': h_c}
+            if domain_c is not None:
+                parts['domain'] = domain_c
+            for key, t in parts.items():
+                if key not in out:
+                    out[key] = torch.empty((x.shape[0],) + tuple(t.shape[1:]), dtype=t.dtype)
+                out[key][sl] = t
 
         dynamics = None
-
-        if times is not None:
-            if isinstance(h, dict):
-                interp_h = {}
-                for mode, hlm in h.items():
-                    r_interp, i_interp = _numba_interp_batch(times, domain, hlm.real.copy(), hlm.imag.copy())
-                    interp_h[mode] = r_interp + 1j * i_interp
-            else:
-                r_interp, i_interp = _numba_interp_batch(times, domain, h.real.copy(), h.imag.copy())
-                interp_h = r_interp + 1j * i_interp
-            interp_domain = times
-        else:
-            interp_domain = domain
-            interp_h = h
+        domain = out.pop('domain', None)
+        interp_h = out['h'].numpy() if inclination is not None else {k: v.numpy() for k, v in out.items()}
+        interp_domain = times if times is not None else domain.numpy()
 
         # Squeeze batch dimension if N = 1
         if q.shape[0] == 1:
