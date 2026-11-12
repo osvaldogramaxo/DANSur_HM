@@ -77,6 +77,29 @@ def _numba_get_pn_amplitude_batch(l, m, v, q, chi1z, chi2z):
         out[i] = _numba_get_pn_amplitude(l, m, v[i], q[i], chi1z[i], chi2z[i])
     return out
 
+def row_interpolator(t, domain):
+    """Linear interpolation along rows, as np.interp(t[i], domain[i], f[i]) with zero
+    outside each row's domain. t is (n, T), domain (n, L) increasing. Returns a function
+    of complex f (n, L) -> (n, T); the indices are computed once and shared across calls."""
+    L = domain.shape[-1]
+    t = t.contiguous()
+    j_raw = torch.searchsorted(domain.contiguous(), t, right=True) - 1
+    j = j_raw.clamp(0, L - 2)
+    x0, x1 = domain.gather(1, j), domain.gather(1, j + 1)
+    inside = (t >= domain[:, :1]) & (t <= domain[:, -1:])
+    jj = j[..., None].expand(-1, -1, 2)
+
+    def interp(f):
+        f = torch.view_as_real(f)
+        f0, f1 = f.gather(1, jj), f.gather(1, jj + 1)
+        res = (f1 - f0) / (x1 - x0)[..., None] * (t - x0)[..., None] + f0
+        res = torch.where((j_raw == L - 1)[..., None], f[:, -1:], res)
+        res = torch.where(inside[..., None], res, 0.0)
+        return torch.view_as_complex(res.contiguous())
+
+    return interp
+
+
 class DANSur(SurrogateEvaluator):
 
 
@@ -328,22 +351,8 @@ class DANSur(SurrogateEvaluator):
         if times is None:
             return domain, out
 
-        # Linear interpolation onto `times` (as np.interp), zero outside each waveform
-        t = torch.as_tensor(times, dtype=torch.float64, device=dev).expand(n, -1).contiguous()
-        j_raw = torch.searchsorted(domain.contiguous(), t, right=True) - 1
-        j = j_raw.clamp(0, L - 2)
-        x0, x1 = domain.gather(1, j), domain.gather(1, j + 1)
-        inside = (t >= domain[:, :1]) & (t <= domain[:, -1:])
-        jj = j[..., None].expand(-1, -1, 2)
-
-        def interp(f):
-            f = torch.view_as_real(f)
-            f0, f1 = f.gather(1, jj), f.gather(1, jj + 1)
-            res = (f1 - f0) / (x1 - x0)[..., None] * (t - x0)[..., None] + f0
-            res = torch.where((j_raw == L - 1)[..., None], f[:, -1:], res)
-            res = torch.where(inside[..., None], res, 0.0)
-            return torch.view_as_complex(res.contiguous())
-
+        t = torch.as_tensor(times, dtype=torch.float64, device=dev).expand(n, -1)
+        interp = row_interpolator(t, domain)
         out = interp(out) if inclination is not None else {k: interp(v) for k, v in out.items()}
         return None, out
 
