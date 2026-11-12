@@ -50,6 +50,7 @@ Or open the [quickstart notebook](examples/quickstart.ipynb) in Colab — no ins
 ```
 .
 ├── dansur/                          # Main Python package
+│   ├── batched_likelihood.py       # DANSur in bilby_torch (batched GPU likelihood)
 │   ├── bilby_source.py             # bilby source model (dansur_binary_black_hole)
 │   ├── surrogate/
 │   │   ├── DANSur_HM_jitted.pt     # Trained TorchScript model (~41 MB), bundled
@@ -73,6 +74,7 @@ Or open the [quickstart notebook](examples/quickstart.ipynb) in Colab — no ins
 │   ├── bilby_run_injection.py       # GW parameter estimation (injection tests)
 │   └── config.yaml                  # Training configuration
 ├── examples/
+│   ├── batched_injection.py        # Injection/recovery with nessai or pocoMC on GPU
 │   ├── quickstart.ipynb            # Colab notebook: modes, strain, batches, bilby
 │   └── waveform_example.py         # Minimal usage example
 ├── pyproject.toml
@@ -90,6 +92,8 @@ Extras add what the rest of the repository needs:
 |---|---|
 | `pip install dansur-hm` | Evaluating waveforms |
 | `pip install "dansur-hm[bilby]"` | The bilby source model (adds bilby, lalsuite) |
+| `pip install "dansur-hm[nessai]"` | Batched-likelihood sampling with nessai (adds bilby_torch) |
+| `pip install "dansur-hm[pocomc]"` | Batched-likelihood sampling with pocoMC (adds bilby_torch) |
 | `pip install "dansur-hm[train]"` | Training, evaluation and PE scripts in `scripts/` |
 
 Until the package is on PyPI, install from GitHub:
@@ -161,6 +165,36 @@ Use it like any other bilby waveform generator (sample in `chirp_mass`/`mass_rat
 convention. The waveform covers about 4000 M before merger, so the (2,2) mode starts at
 roughly 18 Hz × (70 M☉ / M); pick the analysis minimum frequency above that.
 To use a different model instance, call `dansur.bilby_source.model_gen_func(model, times, **params)`.
+
+### Batched likelihood, nessai and pocoMC (GPU parameter estimation)
+
+`dansur.batched_likelihood.BatchedDANSurLikelihood` computes the same log-likelihood ratio
+as bilby's `GravitationalWaveTransient` with the source model above, for thousands of
+parameter points per call, on CPU or GPU. It is DANSur_HM plugged into
+[bilby_torch](https://github.com/osvaldogramaxo/bilby_torch), which follows bilby's time
+and distance marginalisation, can also marginalise over the orbital phase exactly for
+higher modes, does bilby's post-processing in batches, and runs nessai or pocoMC with it:
+
+```python
+from dansur.batched_likelihood import BatchedDANSurLikelihood
+
+likelihood = bilby.gw.likelihood.GravitationalWaveTransient(
+    interferometers, waveform_generator, priors=priors,
+    time_marginalization=True, distance_marginalization=True, jitter_time=False)
+batched = BatchedDANSurLikelihood(likelihood, device="cuda", orbital_phase_marginalization=True,
+                                  time_upsampling="auto")
+log_l = batched.log_likelihood_ratio(priors.sample(4096))   # array of shape (4096,)
+```
+
+It matches bilby to ~1e-12 in log L on CPU (`python -m dansur.batched_likelihood` runs the
+checks). Beyond that, the float32 network rounds slightly differently with batch size and
+device (relative ~1e-5 in the waveform), which moves log L by up to ~1e-3 near a loud
+signal's posterior and more for poor templates. With 3 detectors and 4 s of data at
+2048 Hz, a V100 evaluates ~6000 points/s without marginalisation or with time and distance,
+and ~2200 points/s with orbital phase too, against ~20/s for bilby one point at a time.
+
+See [`examples/batched_injection.py`](examples/batched_injection.py) for a full injection
+and recovery with nessai or pocoMC, and the bilby_torch README for the options.
 
 ---
 

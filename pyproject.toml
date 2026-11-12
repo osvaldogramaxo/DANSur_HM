@@ -34,6 +34,14 @@ bilby = [
     "bilby>=2.7.0",
     "lalsuite>=7.26.1",
 ]
+nessai = [
+    "dansur-hm[bilby]",
+    "bilby-torch[nessai]",
+]
+pocomc = [
+    "dansur-hm[bilby]",
+    "bilby-torch[pocomc]",
+]
 train = [
     "dansur-hm[bilby]",
     "gwpy>=3.0.13",
