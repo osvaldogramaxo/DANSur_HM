@@ -275,13 +275,11 @@ class DANSur(SurrogateEvaluator):
         L = h.shape[-1]
         modes = [tuple(mode) for mode in self.modes_list]
 
-        # Time grid in M, shifted so the peak of sum_lm |h_lm|^2 is at t = 0
+        # Time grid in M. The network is trained with the peak at t = 0 (SXS max_norm_time
+        # lies on a grid point), so the grid is fixed; re-finding the peak with an argmax
+        # would snap it to a neighbouring sample and shift the waveform by 0.5 M or more.
         base = torch.arange(-4096 + 100, 100, 4096 / L, dtype=torch.float64, device=dev)
-        l2_norm_sq = torch.zeros(n, L, dtype=torch.float64, device=dev)
-        for k in range(len(modes)):
-            l2_norm_sq += (h[:, k].abs() ** 2).double()
-        peak_idx = l2_norm_sq.argmax(dim=-1)
-        domain = base - base[peak_idx][:, None]
+        domain = base.expand(n, -1)
 
         # Phase of each mode relative to (2,2) from PN amplitudes at the initial velocity
         angle_22 = torch.angle(h[:, modes.index((2, 2)), :2])
