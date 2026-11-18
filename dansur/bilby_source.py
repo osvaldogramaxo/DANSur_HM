@@ -223,12 +223,14 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
     # ensure mass ratio by convention is 0<q<=1
     out_no_inc['q'] = out_no_inc['q'] if out_no_inc['q'] <= 1 else 1 / out_no_inc['q']
 
-    # Calculate times relative to a fixed merger epoch to avoid GPS time-scale errors.
-    # We ignore the sampled geocent_time in kwargs for grid definition. The end of the
-    # network grid sits at the end of the segment.
+    # Times relative to the merger, ignoring the sampled geocent_time. The merger sits on the
+    # sample peak_idx where the end of the network grid falls within dt of the end of the
+    # segment: exactly on a sample, so no sub-sample offset is left between it and geocent_time.
     post_trig = model.t_end * out_no_inc['M'] * Msuninsec
-    t_merger = float(times_arr[0]) + duration_local - post_trig
-    times_relative = times_arr - t_merger
+    n_samples = len(times_arr)
+    dt = 1.0 / sampling_frequency_local
+    peak_idx = int(np.clip(np.round(n_samples - post_trig / dt), 0, n_samples - 1))
+    times_relative = (np.arange(n_samples) - peak_idx) * dt
 
     # Evaluate the modes on the segment (continued with the inspiral before the network grid)
     out_no_inc['times'] = times_relative
@@ -241,7 +243,6 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
     # Mode order is fixed by dict insertion order (Python 3.7+).
     mode_list_ordered: list[tuple[int, int]] = list(h_modes.keys())
     n_modes = len(mode_list_ordered)
-    n_samples = len(times_arr)
     modes_real = np.empty((n_modes, n_samples), dtype=np.float64)
     modes_imag = np.empty((n_modes, n_samples), dtype=np.float64)
     m_vals = np.empty(n_modes, dtype=np.int64)
@@ -250,8 +251,6 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
         modes_imag[k] = h_modes[(l, m)].imag
         m_vals[k] = m
 
-    # peak_idx: index of merger in times_relative (closest to t=0)
-    peak_idx: int = int(np.argmin(np.abs(times_relative)))
 
     # Fused kernel: taper + cyclic roll, without the peak-phase rotation. The
     # modes of DANSur.__call__ already have a well-defined frame (phases fixed at
