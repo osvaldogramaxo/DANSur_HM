@@ -21,6 +21,7 @@ import bilby
 import numba
 import numpy as np
 from gwsurrogate.surrogate import _sYlm
+from gwtools import Msuninsec
 from numpy import floating
 from numpy.typing import NDArray
 
@@ -55,10 +56,12 @@ def _numba_taper_complex(data_real, data_imag):
     i = start + 1
     n = 0
     LALSIMULATION_RINGING_EXTENT = 19
-    amp_i = (data_real[i]**2 + data_imag[i]**2) ** 0.5
+    # Maxima of the oscillating real part, as LAL's taper of the real strain: the modulus of a
+    # complex mode has none before merger, and the taper would then cover half the signal
+    amp_i = data_real[i]
     while flag < 2 and i != mid:
-        amp_im1 = (data_real[i-1]**2 + data_imag[i-1]**2) ** 0.5
-        amp_ip1 = (data_real[i+1]**2 + data_imag[i+1]**2) ** 0.5
+        amp_im1 = data_real[i-1]
+        amp_ip1 = data_real[i+1]
         if amp_i >= amp_im1 and amp_i >= amp_ip1:
             if amp_i == amp_ip1:
                 i += 1
@@ -68,7 +71,7 @@ def _numba_taper_complex(data_real, data_imag):
             n = i - start
         i += 1
         if i < length:
-            amp_i = (data_real[i]**2 + data_imag[i]**2) ** 0.5
+            amp_i = data_real[i]
     if flag < 2:
         n = mid - start
     if n > 1:
@@ -220,19 +223,16 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
     # ensure mass ratio by convention is 0<q<=1
     out_no_inc['q'] = out_no_inc['q'] if out_no_inc['q'] <= 1 else 1 / out_no_inc['q']
 
-    # Evaluate full surrogate waveform on its innate domain
-    out_no_inc['times'] = None
-    domain_full, h_modes_full, _ = model(**out_no_inc)
     # Calculate times relative to a fixed merger epoch to avoid GPS time-scale errors.
-    # We ignore the sampled geocent_time in kwargs for grid definition.
-    post_trig = domain_full[-1]
+    # We ignore the sampled geocent_time in kwargs for grid definition. The end of the
+    # network grid sits at the end of the segment.
+    post_trig = model.t_end * out_no_inc['M'] * Msuninsec
     t_merger = float(times_arr[0]) + duration_local - post_trig
     times_relative = times_arr - t_merger
 
-    # Interpolate each mode onto the user's times_relative
-    h_modes: dict[tuple[int, int], np.ndarray] = {}
-    for mode, hlm in h_modes_full.items():
-        h_modes[mode] = np.interp(times_relative, domain_full, hlm, left=0, right=0)
+    # Evaluate the modes on the segment (continued with the inspiral before the network grid)
+    out_no_inc['times'] = times_relative
+    _, h_modes, _ = model(**out_no_inc)
 
     # The PN relative-phase offsets between the modes are already applied by
     # DANSur.__call__; applying them here again would double them.

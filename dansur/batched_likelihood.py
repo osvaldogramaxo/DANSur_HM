@@ -21,7 +21,6 @@ from bilby_torch import BatchedLikelihood, BatchedNessai, BatchedPocoMC  # noqa:
 from gwtools.harmonics import s_lambda_lm
 
 from dansur.surrogate import DANSur
-from dansur.surrogate.sur_utils import row_interpolator
 
 
 def _sylm(l, m, theta, phi, s=-2):
@@ -41,12 +40,12 @@ def _sylm(l, m, theta, phi, s=-2):
 
 def _taper_start(h):
     """Rows of complex h (n, T) with the start taper of bilby_source._numba_taper_complex:
-    a Planck-like taper from the first nonzero sample up to the second amplitude maximum
+    a Planck-like taper from the first nonzero sample up to the second maximum of the real part
     more than 19 samples in, or up to mid-signal if there is none."""
     T = h.shape[-1]
     idx = torch.arange(T, device=h.device)
     re, im = h.real, h.imag
-    amp = torch.sqrt(re * re + im * im)
+    amp = re  # maxima of the oscillating real part, as LAL's taper of the real strain
     nonzero = (re != 0) | (im != 0)
     start = torch.where(nonzero, idx, T).amin(dim=1)
     end = torch.where(nonzero, idx, -1).amax(dim=1)
@@ -87,17 +86,15 @@ def dansur_modes(model):
         x = model._get_intrinsic_parameters(q, chi_a, chi_b, None, None, None)
         amp_scale = M * _gwtools.Msuninsec * _gwtools.c / (1e6 * p['luminosity_distance'] * _gwtools.PC_SI)
         t_scale = _gwtools.Msuninsec * M
-        domain, modes = model._evaluate_chunk(x, q, torch.as_tensor(t_scale), torch.as_tensor(amp_scale),
-                                              None, 0.0, None, None)
-
-        # Place the merger as model_gen_func does: interpolate onto the segment with the
-        # end of the waveform at the end of the segment, taper the start, roll the
-        # merger to t = 0
+        # Place the merger as model_gen_func does: the end of the network grid at the end of
+        # the segment, the modes evaluated on the segment (continued with the inspiral before
+        # the network grid), the start tapered and the merger rolled to t = 0
+        t_scale = torch.as_tensor(t_scale)
         dt = times[1] - times[0]
-        t0 = torch.as_tensor(float(times[0]) + len(times) * dt, device=dev)
+        t0 = float(times[0]) + len(times) * dt
         times = torch.as_tensor(times, device=dev)
-        times_relative = times[None, :] - (t0 - domain[:, -1])[:, None]
-        interp = row_interpolator(times_relative, domain)
+        times_relative = times[None, :] - (t0 - model.t_end * t_scale.to(dev))[:, None]
+        _, modes = model._evaluate_chunk(x, q, t_scale, torch.as_tensor(amp_scale), None, 0.0, times_relative, None)
         T = len(times)
         roll = (torch.arange(T, device=dev)[None, :] + times_relative.abs().argmin(dim=1)[:, None]) % T
 
@@ -108,7 +105,7 @@ def dansur_modes(model):
         for (l, m), hlm in modes.items():
             if m <= 0:
                 continue
-            hlm = _taper_start(interp(hlm)).gather(1, roll)
+            hlm = _taper_start(hlm).gather(1, roll)
             yp = torch.as_tensor(_sylm(l, m, theta, np.pi / 2), device=dev)[:, None]
             yn = torch.as_tensor((-1) ** l * _sylm(l, -m, theta, np.pi / 2), device=dev)[:, None]
             H[m] = H.get(m, 0) + yp * hlm
