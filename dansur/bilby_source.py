@@ -239,9 +239,11 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
     # The PN relative-phase offsets between the modes are already applied by
     # DANSur.__call__; applying them here again would double them.
 
-    # Stack modes into contiguous arrays for Numba kernels.
-    # Mode order is fixed by dict insertion order (Python 3.7+).
-    mode_list_ordered: list[tuple[int, int]] = list(h_modes.keys())
+    # Stack the m > 0 modes into contiguous arrays for the Numba kernels; the m < 0 modes are
+    # rebuilt from them after the taper, h_{l,-m} = (-1)^l conj(h_lm). Tapering them separately
+    # breaks that symmetry for odd l: the taper ends at maxima of the real part, which are the
+    # minima of the +m mode when l is odd, so the two windows differ (as dansur_modes does).
+    mode_list_ordered: list[tuple[int, int]] = [lm for lm in h_modes if lm[1] > 0]
     n_modes = len(mode_list_ordered)
     modes_real = np.empty((n_modes, n_samples), dtype=np.float64)
     modes_imag = np.empty((n_modes, n_samples), dtype=np.float64)
@@ -262,18 +264,21 @@ def model_gen_func(model: DANSur, times: NDArray[floating[Any]] | None = None, *
         peak_idx, m_vals, 0.0
     )
 
-    # Perform the mode sum: h = sum_{l,m} Y_{l,m}(theta, phi) * h_{l,m}.
-    # DANSur.__call__ with inclination=None already inserts (l,-m) modes into
-    # the returned dict via equatorial symmetry, so h_modes contains both +m
-    # and -m entries. We therefore use fake_neg_modes=False (plain sum), which
-    # is what the original _mode_sum call did. sYlm scalars are constant for
-    # fixed (theta_jn, phi_ref) and precomputed here to stay out of Numba.
+    # The m < 0 modes from the placed m > 0 ones: h_{l,-m} = (-1)^l conj(h_lm)
+    signs = np.array([(-1.0) ** l for l, _ in mode_list_ordered])[:, None]
+    out_r = np.concatenate([out_r, signs * out_r])
+    out_i = np.concatenate([out_i, -signs * out_i])
+    all_modes = mode_list_ordered + [(l, -m) for l, m in mode_list_ordered]
+
+    # Perform the mode sum: h = sum_{l,m} Y_{l,m}(theta, phi) * h_{l,m}, over +m and -m.
+    # sYlm scalars are constant for fixed (theta_jn, phi_ref) and precomputed here to stay
+    # out of Numba.
     theta_jn = float(out['inclination'])
     phase = float(out['phi_ref'])
     phi_eval = float(np.pi / 2.0 - phase)  # LAL convention
-    ylm_r = np.empty(n_modes)
-    ylm_i = np.empty(n_modes)
-    for k, (l, m) in enumerate(mode_list_ordered):
+    ylm_r = np.empty(len(all_modes))
+    ylm_i = np.empty(len(all_modes))
+    for k, (l, m) in enumerate(all_modes):
         y = _sYlm(-2, l, m, theta_jn, phi_eval)
         ylm_r[k] = y.real
         ylm_i[k] = y.imag
