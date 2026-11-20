@@ -1,26 +1,16 @@
 """
-DANSur_HM in bilby_torch's batched likelihood (https://github.com/osvaldogramaxo/bilby_torch):
-the log-likelihood ratio of
-
-    bilby.gw.likelihood.GravitationalWaveTransient(
-        interferometers,
-        bilby.gw.WaveformGenerator(time_domain_source_model=dansur_binary_black_hole, ...),
-        priors=priors, time_marginalization=..., distance_marginalization=...,
-    ).log_likelihood_ratio()
-
-for many parameter points in one call, in torch on CPU or GPU, optionally marginalised over
-the orbital phase; and nessai or pocoMC sampling with it (BatchedNessai, BatchedPocoMC).
-Requires bilby_torch (the ``nessai`` or ``pocomc`` extra).
-
-Check against bilby:  python -m dansur.batched_likelihood [cpu|cuda]
+DANSur_HM's batched waveform, for likelihoods that take many parameter points per call (e.g.
+bilby_torch.BatchedLikelihood, https://github.com/osvaldogramaxo/bilby_torch):
+dansur_modes(model) returns, for a batch of points, the modes H_m of the bilby source model
+dansur_binary_black_hole, placed on the data segment as bilby_source.model_gen_func places them,
+in torch on CPU or GPU. With DANSur(hybridize=True) they are continued before the network's
+~4000 M with the IMRPhenomT(HM) inspiral.
 """
 import gwtools as _gwtools
 import numpy as np
 import torch
-from bilby_torch import BatchedLikelihood, BatchedNessai, BatchedPocoMC  # noqa: F401 (re-exported)
 from gwtools.harmonics import s_lambda_lm
 
-from dansur.surrogate import DANSur
 
 
 def _sylm(l, m, theta, phi, s=-2):
@@ -71,8 +61,9 @@ def _taper_start(h):
 
 
 def dansur_modes(model):
-    """The batched waveform of bilby_torch.BatchedLikelihood for a DANSur instance: the
-    H_m of dansur_binary_black_hole, placed on the segment as model_gen_func does."""
+    """The batched waveform for a DANSur instance: a function (p, times) -> {m: H_m} giving the H_m
+    of dansur_binary_black_hole for the parameter points p (arrays of mass_1, mass_2, chi_1,
+    chi_2, luminosity_distance, theta_jn), placed on the segment as model_gen_func does."""
 
     @torch.inference_mode()
     def waveform(p, times):
@@ -121,32 +112,3 @@ def dansur_modes(model):
         return H
 
     return waveform
-
-
-def BatchedDANSurLikelihood(likelihood, model=None, device='cpu', **kwargs):
-    """bilby_torch.BatchedLikelihood with DANSur_HM as the waveform. likelihood: the
-    equivalent bilby GravitationalWaveTransient (with dansur_binary_black_hole); model: a
-    DANSur instance, default DANSur(device=device); kwargs as BatchedLikelihood
-    (orbital_phase_marginalization, time_upsampling, chunk_size, ...)."""
-    model = model if model is not None else DANSur(device=device)
-    return BatchedLikelihood(likelihood, dansur_modes(model), device=model.device, **kwargs)
-
-
-if __name__ == '__main__':
-    import sys
-    from bilby_torch.selfcheck import run
-    from dansur.bilby_source import dansur_binary_black_hole
-
-    device = sys.argv[1] if len(sys.argv) > 1 else 'cpu'
-    model = DANSur(device=device)
-    # The float32 network rounds differently for different batch sizes (relative ~1e-5 on
-    # some CPU builds, enough to move log L of poor templates by ~0.1), so on CPU evaluate it
-    # one row at a time: the comparisons then test everything else to round-off
-    if device == 'cpu':
-        network = model._sur_dimless
-
-        def one_row_at_a_time(x):
-            unique, inverse = torch.unique(x, dim=0, return_inverse=True)
-            return torch.cat([network(unique[i:i + 1]) for i in range(len(unique))])[inverse]
-        model._sur_dimless = one_row_at_a_time
-    run(dansur_binary_black_hole, dansur_modes(model), device=device, tol=1e-8 if device == 'cpu' else 1e-3)
