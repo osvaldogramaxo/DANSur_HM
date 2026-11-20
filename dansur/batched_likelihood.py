@@ -52,8 +52,10 @@ def _taper_start(h):
     mid = (start + end) // 2
     off = idx - start[:, None]
 
+    # A maximum is >= its left neighbour and > its right one: a two-sample plateau then counts once,
+    # at its second sample, as in LAL's taper and _numba_taper_complex (which step over the twin)
     local_max = torch.zeros_like(nonzero)
-    local_max[:, 1:-1] = (amp[:, 1:-1] >= amp[:, :-2]) & (amp[:, 1:-1] >= amp[:, 2:])
+    local_max[:, 1:-1] = (amp[:, 1:-1] >= amp[:, :-2]) & (amp[:, 1:-1] > amp[:, 2:])
     qualifying = local_max & (off > 19) & (idx <= mid[:, None] - 1)
     second = qualifying.cumsum(dim=1) >= 2
     n = torch.where(second.any(dim=1), second.int().argmax(dim=1) - start, mid - start)
