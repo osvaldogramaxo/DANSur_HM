@@ -18,15 +18,23 @@ ponytail: the calibrated amplitude terms of IMRPhenomTHM (x^4 ... x^5, collocati
 """
 import math
 
+import numpy as np
 import torch
 
 EULER_GAMMA = 0.5772156649015329
-_THETA_CP = (0.33, 0.45, 0.55, 0.65, 0.75, 0.82)  # (2,2) frequency collocation points in theta
+_THETA_CP = np.array([0.33, 0.45, 0.55, 0.65, 0.75, 0.82])  # (2,2) frequency collocation points in theta
+# The collocation matrix of IMRPhenomTSetPhase22Coefficients (rows theta_i^8 ... theta_i^13) only
+# depends on the fixed thetas, so it is inverted once.
+_AINV = np.linalg.inv(_THETA_CP[:, None] ** np.arange(8, 14))
 MODES = ((2, 2), (2, 1), (3, 3), (4, 4), (5, 5), (3, 2), (4, 3))
 
 
 def _pw(a, b):
     return a ** b
+
+
+def _log(x):
+    return torch.log(x) if torch.is_tensor(x) else np.log(x)
 
 
 def _taylort3_coeffs(eta, chi1, chi2, delta):
@@ -57,8 +65,30 @@ def _taylort3(theta, c):
     th2 = theta * theta
     poly = (1 + c['omega1PN'] * th2 + c['omega1halfPN'] * th2 * theta + c['omega2PN'] * th2 * th2
             + c['omega2halfPN'] * th2 * th2 * theta
-            + (c['omega3PN'] + 107 * torch.log(theta) / 280) * th2 ** 3 + c['omega3halfPN'] * th2 ** 3 * theta)
+            + (c['omega3PN'] + 107 * _log(theta) / 280) * th2 ** 3 + c['omega3halfPN'] * th2 ** 3 * theta)
     return theta ** 3 / 4 * poly
+
+
+def _omega22_lal(c, eta, t):
+    """IMRPhenomTInspiralOmegaAnsatz22 as in LAL: reference for the self-check of PhenomTInspiral."""
+    theta = (-eta * t / 5) ** (-1 / 8)
+    ext = c['C1'] + theta * (c['C2'] + theta * (c['C3'] + theta * (c['C4'] + theta * (c['C5'] + theta * c['C6']))))
+    return _taylort3(theta, c) + theta ** 11 / 4 * ext
+
+
+def _phase22_lal(c, eta, t):
+    """IMRPhenomTInspiralPhaseAnsatz22 as transcribed from LAL (without the constant phOffInsp):
+    reference for the self-check of the polynomial form used by PhenomTInspiral."""
+    thetabar = (-eta * t) ** (-1 / 8)
+    return -(_pw(5,-0.625)*_pw(eta,-2)*_pw(t,-1)*_pw(thetabar,-7)*(3*(-107 + 280*c['omega3PN'])*_pw(5,0.75) + 321*torch.log(thetabar*_pw(5,0.125))*_pw(5,0.75) + 420*c['omega3halfPN']*thetabar*_pw(5,0.875) + 56*(25*c['C1'] + 3*eta*t)*_pw(thetabar,2) + 1050*c['C2']*_pw(5,0.125)*_pw(thetabar,3) + 280*(3*c['C3'] + eta*c['omega1PN']*t)*_pw(5,0.25)*_pw(thetabar,4) + 140*(5*c['C4'] + 3*eta*c['omega1halfPN']*t)*_pw(5,0.375)*_pw(thetabar,5) + 120*(5*c['C5'] + 7*eta*c['omega2PN']*t)*_pw(5,0.5)*_pw(thetabar,6) + 525*c['C6']*_pw(5,0.625)*_pw(thetabar,7) + 105*eta*c['omega2halfPN']*t*torch.log(-t)*_pw(5,0.625)*_pw(thetabar,7)))/84.
+
+
+def _horner(P, x):
+    """sum_k P[:, k] x^k for coefficients P (n, K) and x (n, T), by fused multiply-adds."""
+    r = P[:, -1:]
+    for k in range(P.shape[1] - 2, -1, -1):
+        r = torch.addcmul(P[:, k:k + 1], r, x)
+    return r
 
 
 def _pn_amp_coeffs(l, m, eta, delta, chi1, chi2):
@@ -149,82 +179,203 @@ def _pn_amp_coeffs(l, m, eta, delta, chi1, chi2):
     return [ck * rot for ck in coeffs], amplog * rot
 
 
+def _params(q, chi1, chi2):
+    """NumPy float64 arrays (n,) of q, chi1, chi2 (arrays, tensors or scalars), with eta and delta."""
+    q, chi1, chi2 = (np.atleast_1d(v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)).astype(np.float64)
+                     for v in (q, chi1, chi2))
+    m1, m2 = q / (1 + q), 1 / (1 + q)
+    return q, chi1, chi2, m1 * m2, m1 - m2
+
+
+class PNAmplitudes:
+    """PN mode amplitudes H_lm = sum_k c_k x^(k/2) + c_8 x^3 log(16 x) of _pn_amp_coeffs for a batch:
+    the real and imaginary parts of the nonzero coefficients, set up in NumPy and copied to `device`
+    once, as (n, 1) tensors. Shared by PhenomTInspiral and DANSur's inter-mode phase offsets."""
+
+    def __init__(self, q, chi1, chi2, device='cpu', modes=MODES):
+        q, chi1, chi2, eta, delta = _params(q, chi1, chi2)
+        n, entries = len(q), []
+        for lm in modes:
+            coeffs, amplog = _pn_amp_coeffs(*lm, eta, delta, chi1, chi2)
+            for k, ck in enumerate(list(coeffs) + [amplog]):  # k = 8: the x^3 log(16 x) term
+                if not (isinstance(ck, (int, float, complex)) and ck == 0):
+                    entries.append((lm, k, ck))
+        Z = np.empty((n, 2 * len(entries)))
+        for j, (_, _, ck) in enumerate(entries):
+            Z[:, 2 * j], Z[:, 2 * j + 1] = np.real(ck), np.imag(ck)
+        keep = np.flatnonzero(np.any(Z != 0, axis=0))  # parts that vanish for the whole batch are skipped
+        K = torch.as_tensor(Z[:, keep]).to(device)
+        col = {int(i): K[:, j:j + 1] for j, i in enumerate(keep)}
+        self.terms = {lm: [] for lm in modes}
+        for j, (lm, k, _) in enumerate(entries):
+            re, im = col.get(2 * j), col.get(2 * j + 1)
+            if re is not None or im is not None:
+                self.terms[lm].append((k, re, im))
+
+    def needs_log(self, modes):
+        return any(k == 8 for lm in modes for k, _, _ in self.terms[lm])
+
+    def evaluate(self, pw, modes):
+        """{(l, m): [Re H_lm, Im H_lm]} for powers pw[k] = x^(k/2), k = 1 ... 7, and pw[8] = x^3 log(16 x);
+        None for a part that vanishes, an (n, 1) column for a constant one."""
+        out = {}
+        for lm in modes:
+            parts = [None, None]
+            for k, *cs in self.terms[lm]:
+                for j, ck in enumerate(cs):
+                    if ck is not None:
+                        acc = parts[j]
+                        if k == 0:
+                            parts[j] = ck if acc is None else acc + ck
+                        else:
+                            parts[j] = ck * pw[k] if acc is None else torch.addcmul(acc, ck, pw[k])
+            out[lm] = parts
+        return out
+
+
 class PhenomTInspiral:
     """IMRPhenomT(HM) inspiral for a batch of aligned-spin binaries.
 
-    q >= 1, chi1, chi2: tensors of shape (n,), chi1 the spin of the heavier black hole. Valid well
-    before merger: the inspiral region ends at t = -5 / (eta 0.81^8), about -110 M at q = 1 and
-    -270 M at q = 8.
+    q >= 1, chi1, chi2: arrays or tensors of shape (n,), chi1 the spin of the heavier black hole.
+    The per-binary coefficients are set up in NumPy (a few hundred operations on length-n arrays,
+    cheaper than as many small torch kernels on any device) and moved to `device` (default: that
+    of q) in one copy; everything evaluated per sample runs in torch there.
+    Valid well before merger: the inspiral region ends at t = -5 / (eta 0.81^8), about -110 M at
+    q = 1 and -270 M at q = 8.
     """
 
-    def __init__(self, q, chi1, chi2):
-        q, chi1, chi2 = (torch.as_tensor(v, dtype=torch.float64) for v in (q, chi1, chi2))
+    def __init__(self, q, chi1, chi2, device=None):
+        if device is None:
+            device = q.device if torch.is_tensor(q) else 'cpu'
+        q, chi1, chi2, eta, delta = _params(q, chi1, chi2)
+        n = len(q)
         m1, m2 = q / (1 + q), 1 / (1 + q)
-        eta, delta = m1 * m2, m1 - m2
         S = (m1 ** 2 * chi1 + m2 ** 2 * chi2) / (m1 ** 2 + m2 ** 2)
         c = _taylort3_coeffs(eta, chi1, chi2, delta)
         tt0, cps = _fits(eta, S, chi1 - chi2, delta)
-        # Collocation system of IMRPhenomTSetPhase22Coefficients. The first point is TaylorT3 with the
-        # fitted t0 at theta = 0.33; the matrix only depends on the fixed thetas.
+        # Collocation system of IMRPhenomTSetPhase22Coefficients: the first point is TaylorT3 with the
+        # fitted t0 at theta = 0.33.
         theta_ini = (eta * (tt0 + 5 / (eta * 0.33 ** 8)) / 5) ** (-1 / 8)
-        omega_cp = torch.stack([_taylort3(theta_ini, c)] + cps, -1)
-        th = torch.tensor(_THETA_CP, dtype=torch.float64, device=q.device)
-        b = 4 / th ** 3 * (omega_cp - _taylort3(th, {k: v[:, None] for k, v in c.items()}))
-        A = th[:, None] ** torch.arange(8, 14, dtype=torch.float64, device=q.device)
-        C = torch.linalg.solve(A, b.T).T
-        self.c = {k: v[:, None] for k, v in c.items()}
-        self.c.update({f'C{k + 1}': C[:, k:k + 1] for k in range(6)})
-        self.eta, self.delta, self.chi1, self.chi2 = (v[:, None] for v in (eta, delta, chi1, chi2))
+        omega_cp = np.stack([_taylort3(theta_ini, c)] + cps, -1)
+        b = 4 / _THETA_CP ** 3 * (omega_cp - _taylort3(_THETA_CP, {k: v[:, None] for k, v in c.items()}))
+        C = b @ _AINV.T
+        c.update({f'C{k + 1}': C[:, k] for k in range(6)})
+        self._c = c  # NumPy, for the self-check
+
+        cols = []  # every per-binary coefficient, packed into one (n, K) array
+
+        def put(v):
+            cols.append(v)
+            return len(cols) - 1
+
+        i_eta, i_fac0 = put(eta), put(2 * eta * math.sqrt(16 * math.pi / 5))
+        # omega22 = theta^3/4 [TaylorT3 polynomial + theta^8 (C1 + ... + C6 theta^5)] with
+        # theta = 5^(1/8) thetabar: coefficients of thetabar^3 ... thetabar^16, and of thetabar^9 log(thetabar)
+        s5 = 5 ** (1 / 8)
+        w = {3: 1.0, 5: c['omega1PN'], 6: c['omega1halfPN'], 7: c['omega2PN'], 8: c['omega2halfPN'],
+             9: c['omega3PN'] + 107 / 280 * math.log(5) / 8, 10: c['omega3halfPN'],
+             **{10 + k: c[f'C{k}'] for k in range(1, 7)}}
+        i_w = [put(s5 ** k / 4 * w.get(k, 0.0)) for k in range(3, 17)]
+        i_wL = put(s5 ** 9 / 4 * 107 / 280)
+        # phase22 = (1/eta) [sum_k ph[k + 5] thetabar^k (k = -5 ... 8) + (phL[0] + phL[1] thetabar) log(thetabar)],
+        # derived exactly from the LAL phase ansatz by the generator (t = -thetabar^-8 / eta)
+        logeta = np.log(eta)
+        ph, phL = [0.0] * 14, [0.0] * 2
+        ph[0] = -2/5*5**(3/8)
+        ph[2] = -2/3*5**(5/8)*c['omega1PN']
+        ph[3] = -5**(3/4)*c['omega1halfPN']
+        ph[4] = -2*5**(7/8)*c['omega2PN']
+        ph[5] = (5/4)*logeta*c['omega2halfPN']
+        ph[6] = 10*5**(1/8)*c['omega3PN'] - 107/28*5**(1/8) + (107/224)*5**(1/8)*math.log(5)
+        ph[7] = 5*5**(1/4)*c['omega3halfPN']
+        ph[8] = (10/3)*5**(3/8)*c['C1']
+        ph[9] = (5/2)*math.sqrt(5)*c['C2']
+        ph[10] = 2*5**(5/8)*c['C3']
+        ph[11] = (5/3)*5**(3/4)*c['C4']
+        ph[12] = (10/7)*5**(7/8)*c['C5']
+        ph[13] = (25/4)*c['C6']
+        phL[0] = 10*c['omega2halfPN']
+        phL[1] = (107/28)*5**(1/8)
+        i_ph = [put(v / eta) for v in ph]
+        i_phL = [put(v / eta) for v in phL]
+        Z = np.empty((n, len(cols)))
+        for i, v in enumerate(cols):
+            Z[:, i] = v
+        K = torch.as_tensor(Z).to(device)
+        col = lambda i: K[:, i:i + 1]
+        self.eta, self.fac0 = col(i_eta), col(i_fac0)
+        self.W, self.WL = K[:, i_w[0]:i_w[-1] + 1], col(i_wL)
+        self.P, self.PL0, self.PL1 = K[:, i_ph[0]:i_ph[-1] + 1], col(i_phL[0]), col(i_phL[1])
+        self.amp = PNAmplitudes(q, chi1, chi2, device)
+
+    def _thetabar(self, t):
+        tb = (-self.eta * t) ** (-1 / 8)
+        return tb, torch.log(tb)
+
+    def _omega(self, tb, L):
+        tb3 = tb * tb * tb
+        return torch.addcmul(tb3 * _horner(self.W, tb), self.WL * L, tb3 * tb3 * tb3)
+
+    def _phase(self, tb, L):
+        tb2 = tb * tb
+        return _horner(self.P, tb) / (tb2 * tb2 * tb) + torch.addcmul(self.PL0, self.PL1, tb) * L
 
     def omega22(self, t):
         """(2,2) angular frequency at times t (n, T) in M."""
-        c = self.c
-        theta = (-self.eta * t / 5) ** (-1 / 8)
-        ext = c['C1'] + theta * (c['C2'] + theta * (c['C3'] + theta * (c['C4'] + theta * (c['C5'] + theta * c['C6']))))
-        return _taylort3(theta, c) + theta ** 11 / 4 * ext
+        return self._omega(*self._thetabar(t))
 
     def phase22(self, t):
         """(2,2) phase, h22 ~ exp(-i phase22), up to a constant: the analytic integral of omega22."""
-        c, eta = self.c, self.eta
-        thetabar = (-eta * t) ** (-1 / 8)
-        return -(_pw(5,-0.625)*_pw(eta,-2)*_pw(t,-1)*_pw(thetabar,-7)*(3*(-107 + 280*c['omega3PN'])*_pw(5,0.75) + 321*torch.log(thetabar*_pw(5,0.125))*_pw(5,0.75) + 420*c['omega3halfPN']*thetabar*_pw(5,0.875) + 56*(25*c['C1'] + 3*eta*t)*_pw(thetabar,2) + 1050*c['C2']*_pw(5,0.125)*_pw(thetabar,3) + 280*(3*c['C3'] + eta*c['omega1PN']*t)*_pw(5,0.25)*_pw(thetabar,4) + 140*(5*c['C4'] + 3*eta*c['omega1halfPN']*t)*_pw(5,0.375)*_pw(thetabar,5) + 120*(5*c['C5'] + 7*eta*c['omega2PN']*t)*_pw(5,0.5)*_pw(thetabar,6) + 525*c['C6']*_pw(5,0.625)*_pw(thetabar,7) + 105*eta*c['omega2halfPN']*t*torch.log(-t)*_pw(5,0.625)*_pw(thetabar,7)))/84.
+        return self._phase(*self._thetabar(t))
+
+    def omega_phase22(self, t):
+        """(omega22, phase22) at times t, sharing thetabar."""
+        tb, L = self._thetabar(t)
+        return self._omega(tb, L), self._phase(tb, L)
 
     def modes(self, t, modes=MODES, phase_shift=0.0, return_x=False):
         """r h_lm / M at times t (n, T) in M, with phase22 -> phase22 + phase_shift; also x if return_x."""
-        x = (self.omega22(t) / 2) ** (2 / 3)
+        tb, L = self._thetabar(t)
+        x = (self._omega(tb, L) / 2) ** (2 / 3)
         sx = x.sqrt()
         pw = [None, sx, x]  # x^(k/2), built once and shared by the modes
         for k in range(3, 8):
             pw.append(pw[k - 2] * x)
-        e1 = torch.exp(-0.5j * (self.phase22(t) + phase_shift))  # exp(-i m psi) = e1^m
+        if self.amp.needs_log(modes):
+            pw.append(pw[6] * torch.log(16 * x))
+        e1 = torch.polar(torch.ones_like(x), -0.5 * (self._phase(tb, L) + phase_shift))  # exp(-i m psi) = e1^m
         em = {1: e1}
-        fac0 = 2 * self.eta * math.sqrt(16 * math.pi / 5) * x
+        A = self.fac0 * x
         out = {}
-        for l, m in modes:
-            coeffs, amplog = _pn_amp_coeffs(l, m, self.eta, self.delta, self.chi1, self.chi2)
-            H = coeffs[0] if not (isinstance(coeffs[0], (int, float, complex)) and coeffs[0] == 0) else 0
-            for k in range(1, 8):
-                if not (isinstance(coeffs[k], (int, float, complex)) and coeffs[k] == 0):
-                    H = H + coeffs[k] * pw[k]
-            if not (isinstance(amplog, (int, float, complex)) and amplog == 0):
-                H = H + amplog * pw[6] * torch.log(16 * x)
-            if (l, m) == (2, 2):
-                H = H.abs()
+        for (l, m), parts in self.amp.evaluate(pw, modes).items():
+            Hr, Hi = (torch.zeros_like(x) if p is None else p.expand_as(x) for p in parts)
             for j in range(2, m + 1):
                 if j not in em:
                     em[j] = em[j - 1] * e1
-            out[(l, m)] = fac0 * H * em[m]
+            if (l, m) == (2, 2):
+                out[(l, m)] = (A * torch.hypot(Hr, Hi)) * em[2]
+            else:
+                out[(l, m)] = torch.complex(A * Hr, A * Hi) * em[m]
         return (out, x) if return_x else out
 
+
 if __name__ == '__main__':
-    # self-check: the analytic phase integrates the frequency, and the frequency rises monotonically
+    # self-check: the polynomial forms match the LAL ansatzes, the phase integrates the frequency,
+    # and the frequency rises monotonically
     insp = PhenomTInspiral(torch.tensor([1., 3., 8.]), torch.tensor([0., .5, -.8]), torch.tensor([0., -.3, .8]))
     t = torch.linspace(-2e5, -1000, 400001, dtype=torch.float64).expand(3, -1)
-    w, ph = insp.omega22(t), insp.phase22(t)
+    w, ph = insp.omega_phase22(t)
+    cT = {k: torch.as_tensor(v)[:, None] for k, v in insp._c.items()}
+    w_lal, ph_lal = _omega22_lal(cT, insp.eta, t), _phase22_lal(cT, insp.eta, t)
+    err_w = ((w - w_lal) / w_lal).abs().max().item()
+    d = ph - ph_lal  # equal up to a constant; relative to each row's phase range (the phase crosses zero)
+    err_ph = ((d - d[:, :1]).abs().amax(-1) / ph_lal.abs().amax(-1)).max().item()
+    assert err_w < 1e-13 and err_ph < 1e-12, (err_w, err_ph)
     dph = (ph[:, 2:] - ph[:, :-2]) / (t[:, 2:] - t[:, :-2])
     err = ((dph - w[:, 1:-1]) / w[:, 1:-1]).abs().max().item()
     assert err < 1e-7, err
     assert (w.diff(dim=-1) > 0).all()
     h = insp.modes(t[:, -10:])
     assert all(torch.isfinite(v).all() for v in h.values()) and len(h) == 7
-    print(f'ok: max |dphase/dt - omega| / omega = {err:.1e}')
+    print(f'ok: omega22 vs LAL {err_w:.1e}, phase22 vs LAL {err_ph:.1e} (relative), '
+          f'max |dphase/dt - omega| / omega = {err:.1e}')

@@ -11,20 +11,32 @@ import numpy as np
 from gwtools import gwutils as _gwutils
 from gwsurrogate import SurrogateEvaluator
 from typing import Any
-from .inspiral import PhenomTInspiral, _pn_amp_coeffs
+from .inspiral import PhenomTInspiral, PNAmplitudes
 # from gwsurrogate.surrogate import EvaluateSingleModeSurrogate
 # from EvaluateSingleModeSurrogate import adjust_merger_phase
 
+def pn_amplitudes(modes, v, q, chi1, chi2, amp=None):
+    """Complex PN amplitudes H_lm(v) of inspiral.py (IMRPhenomTHM / Blanchet et al. 2008, with spin
+    terms), Blanchet convention, for several modes: a dict of tensors of shape (n,) on v's device.
+    q >= 1, chi1 (heavier black hole), chi2: arrays or tensors of shape (n,); `amp`, their
+    PNAmplitudes if already set up. The arguments of H_lm set the phase of each mode relative to the
+    (2,2) at the start of the network grid."""
+    if amp is None:
+        amp = PNAmplitudes(q, chi1, chi2, device=v.device, modes=modes)
+    v = v[:, None]
+    pw = [None, v]
+    for k in range(2, 8):
+        pw.append(pw[-1] * v)
+    if amp.needs_log(modes):
+        pw.append(pw[6] * torch.log(16 * v * v))
+    zero = torch.zeros_like(v)
+    return {lm: torch.complex(*((zero if p is None else p.expand_as(v)) for p in parts))[:, 0]
+            for lm, parts in amp.evaluate(pw, modes).items()}
+
+
 def pn_amplitude(l, m, v, q, chi1, chi2):
-    """Complex PN amplitude H_lm(v) of inspiral.py (IMRPhenomTHM / Blanchet et al. 2008, with spin
-    terms), Blanchet convention; tensors of shape (n,), q >= 1, chi1 on the heavier black hole.
-    Its argument sets the phase of each mode relative to the (2,2) at the start of the network grid."""
-    eta, delta = q / (1 + q) ** 2, (q - 1) / (q + 1)
-    coeffs, amplog = _pn_amp_coeffs(l, m, eta, delta, chi1, chi2)
-    H = amplog * v ** 6 * torch.log(16 * v ** 2)
-    for k, ck in enumerate(coeffs):
-        H = H + ck * v ** k
-    return H
+    """pn_amplitudes for a single mode."""
+    return pn_amplitudes([(l, m)], v, q, chi1, chi2)[(l, m)]
 
 
 def row_interpolator(t, domain):
@@ -59,10 +71,10 @@ def _unwrap(p):
     return torch.cat([p[..., :1], p[..., :1] + torch.cumsum(d, -1)], -1)
 
 
-def hybridise(t, base, h_modes, q, chi1, chi2, window=HYBRID_WINDOW):
+def hybridise(t, base, h_modes, insp, window=HYBRID_WINDOW):
     """DANSur modes h_modes[(l, m)] (n, L), given on the network grid base (L,) in M, placed on
-    times t (n, T) in M and continued before the window with the IMRPhenomT(HM) inspiral of
-    inspiral.py, blended across the window with a sin^2 weight.
+    times t (n, T) in M and continued before the window with the IMRPhenomT(HM) inspiral `insp`
+    (an inspiral.PhenomTInspiral of the batch), blended across the window with a sin^2 weight.
 
     The inspiral is aligned to DANSur on the (2,2) phase in the window, by least squares over a
     time shift and a phase shift (Gauss-Newton); the pi ambiguity of the orbital phase is resolved
@@ -71,8 +83,7 @@ def hybridise(t, base, h_modes, q, chi1, chi2, window=HYBRID_WINDOW):
     amplitude in the window, so the amplitude is continuous and tends to PN at early times.
     """
     t1, t2 = window
-    n, dev = t.shape[0], t.device
-    insp = PhenomTInspiral(*(torch.as_tensor(v, dtype=torch.float64).to(dev) for v in (q, chi1, chi2)))
+    n, T, dev = t.shape[0], t.shape[1], t.device
     w = (base >= t1) & (base <= t2)
     tw = base[w].expand(n, -1)
     hw = {lm: h[:, w] for lm, h in h_modes.items()}
@@ -80,21 +91,19 @@ def hybridise(t, base, h_modes, q, chi1, chi2, window=HYBRID_WINDOW):
     phi = -_unwrap(torch.angle(hw[(2, 2)]))
     dt = torch.zeros(n, 1, dtype=torch.float64, device=dev)
     for _ in range(6):
-        r = phi - insp.phase22(tw + dt)
-        J = -insp.omega22(tw + dt)
+        omega, phase = insp.omega_phase22(tw + dt)
+        r, J = phi - phase, -omega
         r, J = r - r.mean(-1, keepdim=True), J - J.mean(-1, keepdim=True)
         dt = dt - (r * J).sum(-1, keepdim=True) / (J * J).sum(-1, keepdim=True)
     dphi = (phi - insp.phase22(tw + dt)).mean(-1, keepdim=True)
 
-    hp = insp.modes(tw + dt, modes=list(hw), phase_shift=dphi)
+    hp, x = insp.modes(tw + dt, modes=list(hw), phase_shift=dphi, return_x=True)
     odd = [lm for lm in hw if lm[1] % 2]
-    if odd:  # phase22 + 2 pi is the other orbital branch: flips the odd-m modes
+    if odd:  # phase22 + 2 pi is the other orbital branch: flips the odd-m modes (|hp| is unchanged)
         e0 = sum(((hw[lm] - hp[lm]).abs() ** 2).sum(-1) for lm in odd)
         e1 = sum(((hw[lm] + hp[lm]).abs() ** 2).sum(-1) for lm in odd)
         dphi = dphi + 2 * math.pi * (e1 < e0)[:, None]
-        hp = insp.modes(tw + dt, modes=list(hw), phase_shift=dphi)
 
-    x = (insp.omega22(tw + dt) / 2) ** (2 / 3)
     xw = x.mean(-1, keepdim=True)
     s = (x / xw) ** 4
     kappa = {}
@@ -104,12 +113,25 @@ def hybridise(t, base, h_modes, q, chi1, chi2, window=HYBRID_WINDOW):
         # ponytail: the clamp guards modes that vanish (odd m at q = 1), where the fit is noise
         kappa[lm] = k.clamp(-0.5, 0.5)
 
-    tc = t.clamp(max=t2)  # the inspiral is only used before t2; the clamp keeps it finite after
-    ins, xo = insp.modes(tc + dt, modes=list(h_modes), phase_shift=dphi, return_x=True)
+    # The blend weight b is 0 for t <= t1 and 1 for t >= t2, so with t increasing along each row the
+    # inspiral is only needed on columns [0, hi) and DANSur only on [lo, T)
+    if T > 1 and bool((t[:, 1:] >= t[:, :-1]).all()):
+        lo, hi = int((t < t1).sum(-1).min()), int((t <= t2).sum(-1).max())
+    else:
+        lo, hi = 0, T
+    ins, xo = insp.modes(t[:, :hi].clamp(max=t2) + dt, modes=list(h_modes), phase_shift=dphi, return_x=True)
     so = (xo / xw) ** 4
-    b = torch.sin(math.pi / 2 * ((t - t1) / (t2 - t1)).clamp(0, 1)) ** 2
-    interp = row_interpolator(t, base.expand(n, -1))
-    return {lm: (1 - b) * ins[lm] * (1 + kappa[lm] * so) + b * interp(h) for lm, h in h_modes.items()}
+    b = torch.sin(math.pi / 2 * ((t[:, lo:hi] - t1) / (t2 - t1)).clamp(0, 1)) ** 2
+    interp = row_interpolator(t[:, lo:].contiguous(), base.expand(n, -1))
+    out = {}
+    for lm, h in h_modes.items():
+        d = interp(h)
+        o = torch.empty(n, T, dtype=torch.complex128, device=dev)
+        o[:, :lo] = ins[lm][:, :lo] * (1 + kappa[lm] * so[:, :lo])
+        o[:, lo:hi] = (1 - b) * ins[lm][:, lo:hi] * (1 + kappa[lm] * so[:, lo:hi]) + b * d[:, :hi - lo]
+        o[:, hi:] = d[:, hi - lo:]
+        out[lm] = o
+    return out
 
 
 class DANSur(SurrogateEvaluator):
@@ -329,12 +351,17 @@ class DANSur(SurrogateEvaluator):
         angle_22 = torch.angle(h[:, modes.index((2, 2)), :2]).double()
         dphi = torch.remainder(angle_22[:, 1] - angle_22[:, 0] + math.pi, 2 * math.pi) - math.pi
         v0 = (dphi.abs() / (domain[:, 1] - domain[:, 0]) / 2.0) ** (1.0 / 3.0)
-        qd, c1, c2 = (torch.as_tensor(a, dtype=torch.float64).to(dev) for a in (q, x[:, 1], x[:, 2]))
+        # The requested times in M, and the inspiral if they reach before the hybrid window
+        t = None if times is None else torch.as_tensor(times, dtype=torch.float64, device=dev).expand(n, -1) / t_scale.to(dev)[:, None]
+        insp = (PhenomTInspiral(q, x[:, 1], x[:, 2], device=dev)
+                if t is not None and self.hybridize and bool((t < HYBRID_WINDOW[1]).any()) else None)
+        H = pn_amplitudes([lm for lm in modes if lm != (2, 2)], v0, q, x[:, 1], x[:, 2],
+                          amp=None if insp is None else insp.amp)
         h_modes = {}
         for k, (l, m) in enumerate(modes):
             hlm = h[:, k].conj().to(torch.complex128)
             if (l, m) != (2, 2):
-                hlm = hlm * torch.exp(1j * torch.angle(pn_amplitude(l, m, v0, qd, c1, c2)))[:, None]
+                hlm = hlm * torch.exp(1j * torch.angle(H[(l, m)]))[:, None]
             h_modes[(l, m)] = hlm
 
         # Planck taper over the last taper_end_duration M
@@ -347,10 +374,9 @@ class DANSur(SurrogateEvaluator):
             h_modes = {mode: hlm * sigma for mode, hlm in h_modes.items()}
 
         # Onto the requested times (in M), continued with the inspiral before the network grid
-        if times is not None:
-            t = torch.as_tensor(times, dtype=torch.float64, device=dev).expand(n, -1) / t_scale.to(dev)[:, None]
-            if self.hybridize and (t < HYBRID_WINDOW[1]).any():
-                h_modes = hybridise(t, base, h_modes, q, x[:, 1], x[:, 2])
+        if t is not None:
+            if insp is not None:
+                h_modes = hybridise(t, base, h_modes, insp)
             else:
                 interp = row_interpolator(t, domain)
                 h_modes = {k: interp(v) for k, v in h_modes.items()}

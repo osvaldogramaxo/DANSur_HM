@@ -104,11 +104,16 @@ def dansur_modes(model):
         # H_m = sum_l Ylm(theta_jn, pi/2) h_lm. For aligned spins h_{l,-m} = (-1)^l conj(h_lm),
         # which placement and taper preserve, so only m > 0 modes are placed
         theta = p['theta_jn']
+        pos = [(l, m) for l, m in modes if m > 0]
+        if len(pos) * n * T <= 2 ** 17:
+            # tiny batches: taper all modes in one call (row-wise, so identical), saving per-op overhead;
+            # for larger ones the bigger temporaries cost more than that saves
+            tapered = _taper_start(torch.cat([modes[lm] for lm in pos])).gather(1, roll.repeat(len(pos), 1))
+            placed = dict(zip(pos, tapered.split(n)))
+        else:
+            placed = {lm: _taper_start(modes[lm]).gather(1, roll) for lm in pos}
         H = {}
-        for (l, m), hlm in modes.items():
-            if m <= 0:
-                continue
-            hlm = _taper_start(hlm).gather(1, roll)
+        for (l, m), hlm in placed.items():
             yp = torch.as_tensor(_sylm(l, m, theta, np.pi / 2), device=dev)[:, None]
             yn = torch.as_tensor((-1) ** l * _sylm(l, -m, theta, np.pi / 2), device=dev)[:, None]
             H[m] = H.get(m, 0) + yp * hlm
